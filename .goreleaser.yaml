@@ -1,0 +1,32 @@
+---
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: forgesync
+gitea_urls:
+  api: https://git.erwanleboucher.dev/api/v1
+  download: https://git.erwanleboucher.dev
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: forgesync
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X git.erwanleboucher.dev/eleboucher/forgesync/internal/version.Version={{.Version}}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    main: ./cmd/forgesync
+    binary: forgesync
+
+archives:
+  - id: forgesync
+    ids:
+      - forgesync

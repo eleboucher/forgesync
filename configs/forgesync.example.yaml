@@ -1,0 +1,26 @@
+# forgesync configuration. Env vars (FORGESYNC_*) override every field below.
+#
+# The source-of-truth Forgejo. forgesync auto-discovers what to sync by reading
+# each repo's push_mirrors.
+source:
+  url: https://forgejo.example.com
+  token: ${FORGESYNC_SOURCE_TOKEN}
+
+# Defaults shown — uncomment to change.
+# pollInterval: 5m
+# healthListen: ":8080"
+# logLevel: info        # debug, info, warn, error
+# logFormat: text       # text, json
+
+bot:
+  username: forgesync-bot
+
+targets:
+  github:
+    token: ${FORGESYNC_GITHUB_TOKEN}
+
+# Forgejo-target tokens are picked up from env vars derived from the mirror
+# host: FORGESYNC_FORGEJO_TOKEN_<HOST>, where <HOST> is uppercased with
+# non-alphanumerics replaced by underscores. Examples:
+#   codeberg.org    → FORGESYNC_FORGEJO_TOKEN_CODEBERG_ORG
+#   git.example.com → FORGESYNC_FORGEJO_TOKEN_GIT_EXAMPLE_COM

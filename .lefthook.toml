@@ -1,0 +1,14 @@
+[pre-commit]
+parallel = true
+
+[pre-commit.commands.lint-go]
+run = "make lint-fix"
+glob = ["*.go"]
+tags = "lint"
+stage_fixed = true
+
+[pre-commit.commands.format-go]
+run = "make fmt"
+glob = ["*.go"]
+tags = "fmt"
+stage_fixed = true

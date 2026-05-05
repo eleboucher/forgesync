@@ -1,0 +1,4 @@
+bin/
+dist/
+configs/forgesync.yaml
+.env

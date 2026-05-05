@@ -1,0 +1,14 @@
+services:
+  forgesync:
+    build: .
+    restart: unless-stopped
+    environment:
+      FORGESYNC_SOURCE_URL: ${FORGESYNC_SOURCE_URL}
+      FORGESYNC_SOURCE_TOKEN: ${FORGESYNC_SOURCE_TOKEN}
+      FORGESYNC_BOT_USERNAME: ${FORGESYNC_BOT_USERNAME:-forgesync-bot}
+      FORGESYNC_GITHUB_TOKEN: ${FORGESYNC_GITHUB_TOKEN:-}
+      FORGESYNC_LOG_FORMAT: ${FORGESYNC_LOG_FORMAT:-json}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs/forgesync.example.yaml:/forgesync/config/forgesync.yaml:ro
