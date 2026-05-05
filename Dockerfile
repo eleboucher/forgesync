@@ -26,4 +26,4 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["/forgesync/forgesync", "healthcheck"]
 
 ENTRYPOINT ["/forgesync/forgesync"]
-CMD ["run", "-c", "/forgesync/config/forgesync.yaml"]
+CMD ["run"]
