@@ -1,15 +1,11 @@
----
 name: Release
-
 on:
   push:
     tags:
       - "v*"
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   goreleaser:
     runs-on: docker
@@ -18,40 +14,33 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
-
       - name: Run GoReleaser
         run: curl -sfL https://goreleaser.com/static/run | VERSION=v2.15.2 bash -s -- release --clean
         env:
           GORELEASER_FORCE_TOKEN: gitea
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEA_SERVER_URL: https://git.erwanleboucher.dev
-
   container:
     runs-on: docker
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
-
       - uses: https://data.forgejo.org/docker/setup-buildx-action@v4
-
       - name: Login to git.erwanleboucher.dev
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: git.erwanleboucher.dev
           username: ${{ vars.USERNAME }}
           password: ${{ secrets.OWNER_PACKAGE_SECRET }}
-
       - name: Login to registry.erwanleboucher.dev
         uses: https://data.forgejo.org/docker/login-action@v4
         with:
           registry: registry.erwanleboucher.dev
           username: ${{ vars.USERNAME }}
-          password: ${{ secrets.FORGESYNC_REGISTRY_TOKEN }}
-
+          password: ${{ secrets.APOCI_REGISTRY_TOKEN }}
       - name: Compute image metadata
         id: meta
         uses: https://data.forgejo.org/docker/metadata-action@v6
@@ -62,7 +51,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-
       - name: Build and push
         uses: https://data.forgejo.org/docker/build-push-action@v7
         with:
