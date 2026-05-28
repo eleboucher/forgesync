@@ -14,16 +14,18 @@ RUN CGO_ENABLED=0 go build \
     -o /forgesync \
     ./cmd/forgesync
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.20
 
 WORKDIR /forgesync
+
+RUN apk add --no-cache git
 
 COPY --from=builder /forgesync /forgesync/forgesync
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD ["/forgesync/forgesync", "healthcheck"]
+  CMD ["forgesync", "healthcheck"]
 
 ENTRYPOINT ["/forgesync/forgesync"]
 CMD ["run"]
