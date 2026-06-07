@@ -21,14 +21,21 @@ import (
 // defensively so we never POST something the server will reject.
 const bodyLimit = 1_000_000
 
+// markerKindPullRequest is the marker Kind a promoted PR shadow carries. Kept
+// in sync with the engine's kind constants.
+const markerKindPullRequest = "pull_request"
+
 type Sink struct {
 	client *forgejoapi.Client
 	bot    string
 	log    *slog.Logger
+	// propagateCloses controls whether a source close is applied to the shadow.
+	// True for canonical→mirror (outbound) sinks; reopens always propagate.
+	propagateCloses bool
 }
 
-func New(client *forgejoapi.Client, botUsername string, log *slog.Logger) *Sink {
-	return &Sink{client: client, bot: botUsername, log: log}
+func New(client *forgejoapi.Client, botUsername string, log *slog.Logger, propagateCloses bool) *Sink {
+	return &Sink{client: client, bot: botUsername, log: log, propagateCloses: propagateCloses}
 }
 
 func (s *Sink) Kind() string { return "forgejo" }
@@ -37,7 +44,7 @@ func (s *Sink) Kind() string { return "forgejo" }
 // it. Skips the PATCH if the rendered body+title+state is unchanged, or if
 // the shadow looks user-edited (updated_at significantly newer than source).
 func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Issue, m marker.Marker) (int64, error) {
-	_ = ctx
+	s.client.SetContext(ctx)
 	body := renderIssueBody(src, m)
 
 	existing, err := s.findIssueByMarker(dest, m, gitea.IssueTypeIssue)
@@ -59,8 +66,16 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		return created.Index, nil
 	}
 
-	reopen := sink.PropagateReopen(string(existing.State), src.State)
-	if existing.Body == body && existing.Title == src.Title && reopen == nil {
+	stateChange := sink.PropagateState(string(existing.State), src.State, s.propagateCloses)
+	// A [PR #N] shadow issue closed by /sync promotion must not be reopened on
+	// every tick just because its source PR is still open. If a promoted PR
+	// shadow exists for this source, leave the closed issue closed.
+	if stateChange != nil && *stateChange == "open" && s.hasPromotedPRShadow(dest, m) {
+		s.log.Debug("forgejo sink: skip reopen of promoted PR shadow issue",
+			"dest", dest.Slug(), "dest_num", existing.Index, "src_id", m.ID)
+		stateChange = nil
+	}
+	if existing.Body == body && existing.Title == src.Title && stateChange == nil {
 		s.log.Debug("forgejo sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existing.Index)
 		return existing.Index, nil
@@ -79,15 +94,16 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		Title: src.Title,
 		Body:  &body,
 	}
-	if reopen != nil {
-		st := gitea.StateType(*reopen)
+	if stateChange != nil {
+		st := gitea.StateType(*stateChange)
 		editOpt.State = &st
 	}
 	if _, _, err := s.client.EditIssue(dest.Owner, dest.Name, existing.Index, editOpt); err != nil {
 		return 0, fmt.Errorf("edit issue: %w", err)
 	}
-	if reopen != nil {
-		s.log.Info("forgejo sink: reopened issue", "dest", dest.Slug(), "dest_num", existing.Index)
+	if stateChange != nil {
+		s.log.Info("forgejo sink: synced issue state",
+			"dest", dest.Slug(), "dest_num", existing.Index, "state", *stateChange)
 	} else {
 		s.log.Debug("forgejo sink: patched issue (title/body)",
 			"dest", dest.Slug(), "dest_num", existing.Index)
@@ -96,7 +112,7 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 }
 
 func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNumber int64, src source.Comment, m marker.Marker) error {
-	_ = ctx
+	s.client.SetContext(ctx)
 	body := renderCommentBody(src, m)
 
 	existing, err := s.findCommentByMarker(dest, destIssueNumber, m)
@@ -137,6 +153,7 @@ func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNum
 // forgesync/pr-{src.Number}, then creates or PATCHes a real Forgejo PR with a
 // marker pointing back at the source. Returns the destination PR number.
 func (s *Sink) UpsertPullRequest(ctx context.Context, dest source.Repo, src source.PullRequest, m marker.Marker, srcGitURL, srcRef string) (int64, error) {
+	s.client.SetContext(ctx)
 	branchName := fmt.Sprintf("forgesync/pr-%d", src.Number)
 	dstURL := s.client.AuthGitURL(dest.Owner, dest.Name)
 
@@ -187,8 +204,18 @@ func (s *Sink) UpsertPullRequest(ctx context.Context, dest source.Repo, src sour
 // HasPRShadow reports whether a real Forgejo PR matching the marker already
 // exists. Used by the engine to skip duplicate promotions.
 func (s *Sink) HasPRShadow(ctx context.Context, dest source.Repo, m marker.Marker) bool {
-	_ = ctx
+	s.client.SetContext(ctx)
 	hit, _ := s.findIssueByMarker(dest, m, gitea.IssueTypePull)
+	return hit != nil
+}
+
+// hasPromotedPRShadow reports whether the issue marker m has already been
+// promoted to a real Forgejo PR (a PR shadow carrying the same source identity).
+// Context is expected to already be set on the client by the caller.
+func (s *Sink) hasPromotedPRShadow(dest source.Repo, m marker.Marker) bool {
+	prMarker := m
+	prMarker.Kind = markerKindPullRequest
+	hit, _ := s.findIssueByMarker(dest, prMarker, gitea.IssueTypePull)
 	return hit != nil
 }
 

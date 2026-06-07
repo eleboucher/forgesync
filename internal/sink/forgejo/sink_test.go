@@ -42,7 +42,7 @@ func newSink(t *testing.T, h http.HandlerFunc) *Sink {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(c, "forgesync-bot", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(c, "forgesync-bot", slog.New(slog.NewTextHandler(io.Discard, nil)), false)
 }
 
 func testRepo() source.Repo { return source.Repo{Owner: testRepoOwner, Name: testRepoName} }
@@ -183,6 +183,93 @@ func TestUpsertIssue_SkipWhenEqual(t *testing.T) {
 	}
 	if patchCalls.Load() != 0 {
 		t.Errorf("expected 0 PATCHes when body equal, got %d", patchCalls.Load())
+	}
+}
+
+func TestUpsertIssue_SkipReopenForPromotedPRShadow(t *testing.T) {
+	// A [PR #N] shadow issue was closed by /sync promotion. Its source PR is
+	// still open, which would normally trigger a reopen — but a promoted PR
+	// shadow exists, so the reopen must be suppressed (no PATCH at all).
+	m := testMarker() // kind=issue
+	src := testIssue(stateOpen, time.Now())
+	body := renderIssueBody(src, m)
+
+	shadowIssue := &gitea.Issue{
+		Index:   7,
+		Title:   src.Title,
+		Body:    body,
+		State:   stateClosed,
+		Updated: src.UpdatedAt,
+	}
+	prMarker := m
+	prMarker.Kind = markerKindPullRequest
+	prShadow := &gitea.Issue{
+		Index: 8,
+		Title: "promoted",
+		Body:  "promoted\n\n" + prMarker.String(),
+		State: stateOpen,
+	}
+
+	var patchCalls atomic.Int32
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			patchCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(&gitea.Issue{Index: 7})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues"):
+			if r.URL.Query().Get("type") == "pulls" {
+				_ = json.NewEncoder(w).Encode([]*gitea.Issue{prShadow})
+			} else {
+				_ = json.NewEncoder(w).Encode([]*gitea.Issue{shadowIssue})
+			}
+		}
+	})
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if patchCalls.Load() != 0 {
+		t.Errorf("expected 0 PATCHes (reopen suppressed for promoted PR shadow), got %d", patchCalls.Load())
+	}
+}
+
+func TestUpsertIssue_ReopensWhenNoPRShadow(t *testing.T) {
+	// Same setup as the suppression test but with NO promoted PR shadow: the
+	// reopen must fire (proves suppression is conditional, not unconditional).
+	m := testMarker()
+	src := testIssue(stateOpen, time.Now())
+	body := renderIssueBody(src, m)
+
+	shadowIssue := &gitea.Issue{
+		Index:   7,
+		Title:   src.Title,
+		Body:    body,
+		State:   stateClosed,
+		Updated: src.UpdatedAt,
+	}
+
+	var sentState gitea.StateType
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch:
+			var req gitea.EditIssueOption
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.State != nil {
+				sentState = *req.State
+			}
+			_ = json.NewEncoder(w).Encode(&gitea.Issue{Index: 7})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues"):
+			if r.URL.Query().Get("type") == "pulls" {
+				_ = json.NewEncoder(w).Encode([]*gitea.Issue{}) // no PR shadow
+			} else {
+				_ = json.NewEncoder(w).Encode([]*gitea.Issue{shadowIssue})
+			}
+		}
+	})
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if sentState != stateOpen {
+		t.Errorf("expected reopen PATCH with state=open, got %q", sentState)
 	}
 }
 

@@ -15,6 +15,7 @@ type Config struct {
 	Source          ForgejoEndpoint `yaml:"source"           envPrefix:"FORGESYNC_SOURCE_"`
 	PollInterval    time.Duration   `yaml:"pollInterval"     env:"FORGESYNC_POLL_INTERVAL"`
 	InitialBackfill time.Duration   `yaml:"initialBackfill"  env:"FORGESYNC_INITIAL_BACKFILL"`
+	TickTimeout     time.Duration   `yaml:"tickTimeout"      env:"FORGESYNC_TICK_TIMEOUT"`
 	HealthListen    string          `yaml:"healthListen"     env:"FORGESYNC_HEALTH_LISTEN"`
 	LogLevel        string          `yaml:"logLevel"         env:"FORGESYNC_LOG_LEVEL"`
 	LogFormat       string          `yaml:"logFormat"        env:"FORGESYNC_LOG_FORMAT"`
@@ -106,6 +107,9 @@ func validate(c *Config) error {
 	}
 	if c.PollInterval <= 0 {
 		return errors.New("pollInterval must be > 0")
+	}
+	if c.TickTimeout < 0 {
+		return errors.New("tickTimeout must be >= 0 (0 disables the per-tick deadline)")
 	}
 	return nil
 }

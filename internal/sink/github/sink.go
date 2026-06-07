@@ -28,10 +28,13 @@ const (
 type Sink struct {
 	client *gh.Client
 	log    *slog.Logger
+	// propagateCloses controls whether a source close is applied to the shadow.
+	// True for canonical→mirror (outbound) sinks; reopens always propagate.
+	propagateCloses bool
 }
 
-func New(client *gh.Client, log *slog.Logger) *Sink {
-	return &Sink{client: client, log: log}
+func New(client *gh.Client, log *slog.Logger, propagateCloses bool) *Sink {
+	return &Sink{client: client, log: log, propagateCloses: propagateCloses}
 }
 
 func (s *Sink) Kind() string { return "github" }
@@ -69,8 +72,8 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	existingNum := int64(existing.GetNumber())
-	reopen := sink.PropagateReopen(existing.GetState(), src.State)
-	if existing.GetBody() == body && existing.GetTitle() == src.Title && reopen == nil {
+	stateChange := sink.PropagateState(existing.GetState(), src.State, s.propagateCloses)
+	if existing.GetBody() == body && existing.GetTitle() == src.Title && stateChange == nil {
 		s.log.Debug("github sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existingNum)
 		return existingNum, nil
@@ -85,19 +88,19 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		return existingNum, nil
 	}
 
-	// Asymmetric state policy: propagate reopens only. Never close from PATCH.
 	editReq := &gh.IssueRequest{
 		Title: gh.Ptr(src.Title),
 		Body:  gh.Ptr(body),
 	}
-	if reopen != nil {
-		editReq.State = reopen
+	if stateChange != nil {
+		editReq.State = stateChange
 	}
 	if _, _, err := s.client.Issues.Edit(ctx, dest.Owner, dest.Name, existing.GetNumber(), editReq); err != nil {
 		return 0, fmt.Errorf("edit issue: %w", err)
 	}
-	if reopen != nil {
-		s.log.Info("github sink: reopened issue", "dest", dest.Slug(), "dest_num", existingNum)
+	if stateChange != nil {
+		s.log.Info("github sink: synced issue state",
+			"dest", dest.Slug(), "dest_num", existingNum, "state", *stateChange)
 	} else {
 		s.log.Debug("github sink: patched issue (title/body)",
 			"dest", dest.Slug(), "dest_num", existingNum)

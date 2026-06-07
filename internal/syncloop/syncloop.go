@@ -79,16 +79,19 @@ func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
 	ghClient := githubapi.New(cfg.Targets.GitHub.Token, "")
 
 	return &Engine{
-		cfg:           cfg,
-		srcClient:     srcClient,
-		ghClient:      ghClient,
-		log:           log,
-		canonicalSrc:  fjsource.NewWithClient(srcClient, canonicalHost),
-		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log),
-		github:        ghsink.New(ghClient, log),
-		githubSrc:     ghsource.NewWithClient(ghClient),
-		forgejoSinks:  map[string]*fjsink.Sink{},
-		forgejoSrcs:   map[string]*fjsource.Provider{},
+		cfg:          cfg,
+		srcClient:    srcClient,
+		ghClient:     ghClient,
+		log:          log,
+		canonicalSrc: fjsource.NewWithClient(srcClient, canonicalHost),
+		// canonicalSink receives mirror→canonical writes (Flow A): never let a
+		// mirror close the source-of-truth issue.
+		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log, false),
+		// github sink receives canonical→mirror writes (Flow B): propagate closes.
+		github:       ghsink.New(ghClient, log, true),
+		githubSrc:    ghsource.NewWithClient(ghClient),
+		forgejoSinks: map[string]*fjsink.Sink{},
+		forgejoSrcs:  map[string]*fjsource.Provider{},
 	}, nil
 }
 
@@ -117,8 +120,22 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 func (e *Engine) tick(parent context.Context, since time.Time) error {
-	ctx, cancel := context.WithTimeout(parent, e.cfg.Window())
-	defer cancel()
+	// A whole-tick deadline is opt-in (FORGESYNC_TICK_TIMEOUT). It is a separate
+	// concern from Window() (the poll look-back); conflating them used to cancel
+	// large ticks at 2×pollInterval. Default 0 means: bound only by per-request
+	// HTTP timeouts and shutdown of the parent context.
+	ctx := parent
+	if e.cfg.TickTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(parent, e.cfg.TickTimeout)
+		defer cancel()
+	}
+
+	// The canonical client is shared and its context is set per-call by the
+	// source/sink methods. Install this tick's context up front so the direct
+	// srcClient calls below (SearchRepos, ListPushMirrors, promotion edits) don't
+	// run under a previous tick's already-cancelled context.
+	e.srcClient.SetContext(ctx)
 
 	e.log.Info("tick start", "since", since)
 
@@ -156,8 +173,11 @@ func (e *Engine) safeSyncRepo(ctx context.Context, repo *gitea.Repository, since
 }
 
 func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since time.Time) error {
-	_ = ctx
 	owner, name := splitFullName(repo.FullName)
+	if owner == "" || name == "" {
+		e.log.Warn("skip repo: unexpected full name", "full_name", repo.FullName)
+		return nil
+	}
 	mirrors, _, err := e.srcClient.ListPushMirrors(owner, name, gitea.ListOptions{})
 	if err != nil {
 		return err
@@ -280,6 +300,8 @@ func (e *Engine) promotePR(ctx context.Context, canonical, target source.Repo, i
 	if e.cfg.Targets.GitHub.Token != "" {
 		if authed, err := gitops.AuthURL(srcGitURL, "oauth2", e.cfg.Targets.GitHub.Token); err == nil {
 			srcGitURL = authed
+		} else {
+			e.log.Warn("auth source git URL failed; fetching unauthenticated", "err", err)
 		}
 	}
 	srcRef := fmt.Sprintf("refs/pull/%d/head", issMarker.ID)
@@ -486,22 +508,41 @@ func (e *Engine) sinkForHost(host string) (sink.Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("forgejo client for %s: %w", host, err)
 	}
-	s := fjsink.New(client, e.cfg.Bot.Username, e.log)
+	// Outbound (Flow B) sink: propagate closes canonical→mirror.
+	s := fjsink.New(client, e.cfg.Bot.Username, e.log, true)
 	e.forgejoSinks[host] = s
 	return s, nil
 }
 
 // parseRemoteRepo pulls (host, owner/name) out of a push_mirror remote_address.
+// Handles both URL forms (https://host/owner/repo[.git], ssh://[user@]host/...)
+// and scp-like SSH syntax ([user@]host:owner/repo[.git]).
 func parseRemoteRepo(remote string) (host string, repo source.Repo, err error) {
-	u, err := url.Parse(remote)
-	if err != nil {
-		return "", source.Repo{}, err
+	var rawHost, rawPath string
+	if strings.Contains(remote, "://") {
+		u, perr := url.Parse(remote)
+		if perr != nil {
+			return "", source.Repo{}, perr
+		}
+		rawHost, rawPath = u.Hostname(), u.Path
+	} else {
+		// scp-like: [user@]host:owner/repo(.git)
+		rest := remote
+		if at := strings.LastIndex(rest, "@"); at != -1 {
+			rest = rest[at+1:]
+		}
+		h, p, ok := strings.Cut(rest, ":")
+		if !ok {
+			return "", source.Repo{}, fmt.Errorf("invalid remote address: %s", remote)
+		}
+		rawHost, rawPath = h, p
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+
+	parts := strings.Split(strings.Trim(rawPath, "/"), "/")
 	if len(parts) != 2 {
 		return "", source.Repo{}, fmt.Errorf("invalid remote address: %s", remote)
 	}
-	return strings.ToLower(u.Host), source.Repo{
+	return strings.ToLower(rawHost), source.Repo{
 		Owner: parts[0],
 		Name:  strings.TrimSuffix(parts[1], ".git"),
 	}, nil

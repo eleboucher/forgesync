@@ -30,11 +30,15 @@ const (
 )
 
 func newSink(t *testing.T, h http.HandlerFunc) *Sink {
+	return newSinkCloses(t, h, true)
+}
+
+func newSinkCloses(t *testing.T, h http.HandlerFunc, propagateCloses bool) *Sink {
 	t.Helper()
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
 	c := githubapi.New("test-token", ts.URL)
-	return New(c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(c, slog.New(slog.NewTextHandler(io.Discard, nil)), propagateCloses)
 }
 
 func testRepo() source.Repo { return source.Repo{Owner: testRepoOwner, Name: testRepoName} }
@@ -146,7 +150,8 @@ func TestUpsertIssue_PATCHReopens(t *testing.T) {
 }
 
 func TestUpsertIssue_PATCHDoesNotClose(t *testing.T) {
-	// Shadow is open, source is closed → DO NOT propagate the close.
+	// Inbound sink (propagateCloses=false): shadow open, source closed → DO NOT
+	// propagate the close.
 	m := testMarker()
 	now := time.Now()
 	existing := &gh.Issue{
@@ -157,7 +162,7 @@ func TestUpsertIssue_PATCHDoesNotClose(t *testing.T) {
 		UpdatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
 	}
 	var stateField *string
-	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+	sink := newSinkCloses(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == searchPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
@@ -167,12 +172,46 @@ func TestUpsertIssue_PATCHDoesNotClose(t *testing.T) {
 			stateField = req.State
 			_ = json.NewEncoder(w).Encode(&gh.Issue{Number: gh.Ptr(5)})
 		}
-	})
+	}, false)
 	if _, err := sink.UpsertIssue(context.Background(), testRepo(), testIssue(stateClosed, now), m); err != nil {
 		t.Fatal(err)
 	}
 	if stateField != nil {
 		t.Errorf("PATCH must NOT send state on close transition, got %q", *stateField)
+	}
+}
+
+func TestUpsertIssue_PATCHPropagatesClose(t *testing.T) {
+	// Outbound sink (propagateCloses=true): shadow open, source closed →
+	// propagate the close.
+	m := testMarker()
+	now := time.Now()
+	existing := &gh.Issue{
+		Number:    gh.Ptr(5),
+		Title:     gh.Ptr("hi"), // matches src title
+		Body:      gh.Ptr("old\n\n" + m.String()),
+		State:     gh.Ptr(stateOpen),
+		UpdatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
+	}
+	var sentState string
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == searchPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
+		case r.Method == http.MethodPatch:
+			var req gh.IssueRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.State != nil {
+				sentState = *req.State
+			}
+			_ = json.NewEncoder(w).Encode(&gh.Issue{Number: gh.Ptr(5)})
+		}
+	})
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), testIssue(stateClosed, now), m); err != nil {
+		t.Fatal(err)
+	}
+	if sentState != stateClosed {
+		t.Errorf("PATCH must send state=closed on close transition, got %q", sentState)
 	}
 }
 
