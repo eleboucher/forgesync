@@ -41,15 +41,24 @@ func ShadowDrifted(shadowUpdated, sourceUpdated time.Time) bool {
 	return shadowUpdated.Sub(sourceUpdated) > shadowDriftThreshold
 }
 
-// PropagateReopen returns "open" iff the source is open and the destination is
-// closed — a reopen we should propagate. Returns nil otherwise: closes never
-// flow, and equal states need no PATCH.
-func PropagateReopen(existingState, srcState string) *string {
-	if existingState == "closed" && srcState == "open" {
+// PropagateState returns the state to apply to the shadow when it differs from
+// the source, or nil when no state PATCH is needed.
+//
+// Reopens (source open, shadow closed) always propagate. Closes (source closed,
+// shadow open) propagate only when allowClose is true — set per sink by
+// direction: canonical→mirror propagates closes, mirror→canonical does not, so
+// an external user closing a mirror issue can't close the source-of-truth issue.
+func PropagateState(existingState, srcState string, allowClose bool) *string {
+	switch {
+	case existingState == "closed" && srcState == "open":
 		s := "open"
 		return &s
+	case allowClose && existingState == "open" && srcState == "closed":
+		s := "closed"
+		return &s
+	default:
+		return nil
 	}
-	return nil
 }
 
 // RenderBody composes the destination body for an issue or comment: the
@@ -59,8 +68,9 @@ func RenderBody(author source.User, sourceURL string, at time.Time, body string,
 	attribution := authorAttribution(author, sourceURL, at)
 	markerStr := m.String()
 	body = strings.TrimSpace(body)
+	notice := fmt.Sprintf("\n\n_… body truncated; view full source at %s_", sourceURL)
 
-	body, truncated := truncateForLimit(body, bodyLimit, attribution, markerStr)
+	body, truncated := truncateForLimit(body, bodyLimit, attribution, markerStr, notice)
 
 	var b strings.Builder
 	b.WriteString(attribution)
@@ -69,7 +79,7 @@ func RenderBody(author source.User, sourceURL string, at time.Time, body string,
 		b.WriteString(body)
 	}
 	if truncated {
-		fmt.Fprintf(&b, "\n\n_… body truncated; view full source at %s_", sourceURL)
+		b.WriteString(notice)
 	}
 	b.WriteString("\n\n")
 	b.WriteString(markerStr)
@@ -78,10 +88,14 @@ func RenderBody(author source.User, sourceURL string, at time.Time, body string,
 
 // truncateForLimit shrinks body so the final composed body (attribution +
 // body + truncation notice + marker) fits under limit. Truncates on rune
-// boundaries so we don't split a multi-byte character.
-func truncateForLimit(body string, limit int, attribution, markerStr string) (string, bool) {
-	const noticeReserve = 100
-	overhead := utf8.RuneCountInString(attribution) + utf8.RuneCountInString(markerStr) + noticeReserve + 8
+// boundaries so we don't split a multi-byte character. The reserve accounts for
+// the actual notice (which embeds the source URL) plus the two "\n\n"
+// separators the layout adds around the body and before the marker.
+func truncateForLimit(body string, limit int, attribution, markerStr, notice string) (string, bool) {
+	const separators = 4 // "\n\n" before body + "\n\n" before marker
+	overhead := utf8.RuneCountInString(attribution) +
+		utf8.RuneCountInString(markerStr) +
+		utf8.RuneCountInString(notice) + separators
 	budget := max(limit-overhead, 0)
 	if utf8.RuneCountInString(body) <= budget {
 		return body, false

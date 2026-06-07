@@ -25,7 +25,11 @@ func TestParseRemoteRepo(t *testing.T) {
 		{"https://" + gh + "/" + owner + "/hello-world.git", gh, owner, "hello-world", false},
 		{"https://" + gh + "/" + owner + "/hello-world", gh, owner, "hello-world", false},
 		{"https://codeberg.org/" + testForgejo + "/" + testForgejo + ".git", "codeberg.org", testForgejo, testForgejo, false},
+		{"git@" + gh + ":" + owner + "/hello-world.git", gh, owner, "hello-world", false},
+		{"ssh://git@codeberg.org/" + testForgejo + "/" + testForgejo + ".git", "codeberg.org", testForgejo, testForgejo, false},
+		{"ssh://git@git.example.com:2222/foo/bar.git", "git.example.com", "foo", "bar", false},
 		{"https://example.com/just-one", "", "", "", true},
+		{"git@example.com:just-one", "", "", "", true},
 		{"::not a url::", "", "", "", true},
 	}
 	for _, tc := range cases {

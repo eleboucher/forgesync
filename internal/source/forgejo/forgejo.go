@@ -25,7 +25,7 @@ func (p *Provider) Kind() string { return "forgejo" }
 func (p *Provider) Host() string { return p.host }
 
 func (p *Provider) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
-	_ = ctx
+	p.client.SetContext(ctx)
 	out := []source.Issue{}
 	for page := 1; ; page++ {
 		batch, _, err := p.client.ListRepoIssues(repo.Owner, repo.Name, gitea.ListIssueOption{
@@ -55,7 +55,7 @@ func (p *Provider) ListPullRequests(_ context.Context, _ source.Repo, _ source.L
 }
 
 func (p *Provider) ListComments(ctx context.Context, repo source.Repo, issueNumber int64, opts source.ListOpts) ([]source.Comment, error) {
-	_ = ctx
+	p.client.SetContext(ctx)
 	out := []source.Comment{}
 	for page := 1; ; page++ {
 		batch, _, err := p.client.ListIssueComments(repo.Owner, repo.Name, issueNumber, gitea.ListIssueCommentOptions{

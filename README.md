@@ -45,6 +45,8 @@ cp configs/forgesync.example.yaml configs/forgesync.yaml
 | `FORGESYNC_GITHUB_TOKEN`         | --      | only if any push mirror points at github.com |
 | `FORGESYNC_FORGEJO_TOKEN_<HOST>` | --      | one per non-github mirror host (see below)   |
 | `FORGESYNC_POLL_INTERVAL`        | `5m`    | no                                           |
+| `FORGESYNC_INITIAL_BACKFILL`     | `1h`    | no (look-back on the first tick)             |
+| `FORGESYNC_TICK_TIMEOUT`         | `0`     | no (`0` = no per-tick deadline)              |
 | `FORGESYNC_HEALTH_LISTEN`        | `:8080` | no                                           |
 | `FORGESYNC_LOG_FORMAT`           | `text`  | no (`text` or `json`)                        |
 | `FORGESYNC_LOG_LEVEL`            | `info`  | no                                           |

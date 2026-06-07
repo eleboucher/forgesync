@@ -8,6 +8,8 @@ source:
 
 # Defaults shown — uncomment to change.
 # pollInterval: 5m
+# initialBackfill: 1h    # look-back used only on the first tick
+# tickTimeout: 0s        # per-tick deadline; 0 disables it (bounded by HTTP timeouts)
 # healthListen: ":8080"
 # logLevel: info        # debug, info, warn, error
 # logFormat: text       # text, json
