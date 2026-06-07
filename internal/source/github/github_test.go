@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v75/github"
+	gh "github.com/google/go-github/v88/github"
 )
 
 func TestMapIssue_PRGetsTitlePrefixAndPRURL(t *testing.T) {

@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"code.gitea.io/sdk/gitea"
-	gh "github.com/google/go-github/v75/github"
+	gh "github.com/google/go-github/v88/github"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/config"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/forgejoapi"

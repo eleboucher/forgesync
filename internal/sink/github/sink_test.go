@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/google/go-github/v75/github"
+	gh "github.com/google/go-github/v88/github"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/githubapi"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"

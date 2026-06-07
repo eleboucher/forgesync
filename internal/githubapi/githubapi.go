@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/google/go-github/v75/github"
+	"github.com/google/go-github/v88/github"
 	"github.com/hashicorp/go-retryablehttp"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/version"

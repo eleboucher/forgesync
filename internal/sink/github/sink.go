@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"time"
 
-	gh "github.com/google/go-github/v75/github"
+	gh "github.com/google/go-github/v88/github"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/sink"
