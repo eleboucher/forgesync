@@ -14,7 +14,7 @@ RUN CGO_ENABLED=0 go build \
     -o /forgesync \
     ./cmd/forgesync
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 WORKDIR /forgesync
 
