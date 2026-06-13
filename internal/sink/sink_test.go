@@ -32,21 +32,19 @@ func TestPropagateState(t *testing.T) {
 	const open, closed = "open", "closed"
 	cases := []struct {
 		existing, src string
-		allowClose    bool
 		wantNil       bool
 		wantState     string
 		name          string
 	}{
-		{closed, open, false, false, open, "reopen propagates without allowClose"},
-		{closed, open, true, false, open, "reopen propagates with allowClose"},
-		{open, closed, false, true, "", "close suppressed without allowClose"},
-		{open, closed, true, false, closed, "close propagates with allowClose"},
-		{open, open, true, true, "", "equal open"},
-		{closed, closed, true, true, "", "equal closed"},
+		{closed, open, false, open, "reopen propagates"},
+		{open, closed, false, closed, "close propagates"},
+		{open, open, true, "", "equal open"},
+		{closed, closed, true, "", "equal closed"},
+		{open, "", true, "", "unknown source state ignored"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := PropagateState(tc.existing, tc.src, tc.allowClose)
+			got := PropagateState(tc.existing, tc.src)
 			if tc.wantNil {
 				if got != nil {
 					t.Errorf("expected nil, got %q", *got)

@@ -28,13 +28,10 @@ const (
 type Sink struct {
 	client *gh.Client
 	log    *slog.Logger
-	// propagateCloses controls whether a source close is applied to the shadow.
-	// True for canonical→mirror (outbound) sinks; reopens always propagate.
-	propagateCloses bool
 }
 
-func New(client *gh.Client, log *slog.Logger, propagateCloses bool) *Sink {
-	return &Sink{client: client, log: log, propagateCloses: propagateCloses}
+func New(client *gh.Client, log *slog.Logger) *Sink {
+	return &Sink{client: client, log: log}
 }
 
 func (s *Sink) Kind() string { return "github" }
@@ -72,7 +69,7 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	existingNum := int64(existing.GetNumber())
-	stateChange := sink.PropagateState(existing.GetState(), src.State, s.propagateCloses)
+	stateChange := sink.PropagateState(existing.GetState(), src.State)
 	if existing.GetBody() == body && existing.GetTitle() == src.Title && stateChange == nil {
 		s.log.Debug("github sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existingNum)
@@ -88,6 +85,8 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		return existingNum, nil
 	}
 
+	// State tracks the source both ways (open and closed). Safe because we only
+	// ever PATCH a shadow from its native source, never the other way around.
 	editReq := &gh.IssueRequest{
 		Title: gh.Ptr(src.Title),
 		Body:  gh.Ptr(body),
@@ -146,6 +145,31 @@ func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNum
 	}
 	s.log.Debug("github sink: patched comment",
 		"dest", dest.Slug(), "dest_issue", destIssueNumber, "comment_id", existing.GetID())
+	return nil
+}
+
+// CommentAndClosePullRequest posts comment on PR #number and then closes it.
+// Used after a PR is promoted into the canonical Forgejo (the source of truth)
+// so the now-redundant GitHub PR doesn't linger open. forgesync used to rely on
+// the push-mirror deleting the head branch to make GitHub auto-close the PR, but
+// that only happens when the mirror prunes refs — an additive push never closes
+// anything — so we close it explicitly here.
+//
+// The comment carries the marker so the inbound read path (marker.Has) filters
+// it out and never echoes it back into Forgejo.
+func (s *Sink) CommentAndClosePullRequest(ctx context.Context, dest source.Repo, number int64, comment string, m marker.Marker) error {
+	body := marker.WithMarker(comment, m)
+	if _, _, err := s.client.Issues.CreateComment(ctx, dest.Owner, dest.Name, int(number), &gh.IssueComment{
+		Body: gh.Ptr(body),
+	}); err != nil {
+		return fmt.Errorf("comment on promoted PR: %w", err)
+	}
+	if _, _, err := s.client.PullRequests.Edit(ctx, dest.Owner, dest.Name, int(number), &gh.PullRequest{
+		State: gh.Ptr(stateClosed),
+	}); err != nil {
+		return fmt.Errorf("close promoted PR: %w", err)
+	}
+	s.log.Info("github sink: closed promoted PR", "dest", dest.Slug(), "dest_num", number)
 	return nil
 }
 

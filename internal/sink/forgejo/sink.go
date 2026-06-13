@@ -21,21 +21,14 @@ import (
 // defensively so we never POST something the server will reject.
 const bodyLimit = 1_000_000
 
-// markerKindPullRequest is the marker Kind a promoted PR shadow carries. Kept
-// in sync with the engine's kind constants.
-const markerKindPullRequest = "pull_request"
-
 type Sink struct {
 	client *forgejoapi.Client
 	bot    string
 	log    *slog.Logger
-	// propagateCloses controls whether a source close is applied to the shadow.
-	// True for canonical→mirror (outbound) sinks; reopens always propagate.
-	propagateCloses bool
 }
 
-func New(client *forgejoapi.Client, botUsername string, log *slog.Logger, propagateCloses bool) *Sink {
-	return &Sink{client: client, bot: botUsername, log: log, propagateCloses: propagateCloses}
+func New(client *forgejoapi.Client, botUsername string, log *slog.Logger) *Sink {
+	return &Sink{client: client, bot: botUsername, log: log}
 }
 
 func (s *Sink) Kind() string { return "forgejo" }
@@ -66,15 +59,7 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		return created.Index, nil
 	}
 
-	stateChange := sink.PropagateState(string(existing.State), src.State, s.propagateCloses)
-	// A [PR #N] shadow issue closed by /sync promotion must not be reopened on
-	// every tick just because its source PR is still open. If a promoted PR
-	// shadow exists for this source, leave the closed issue closed.
-	if stateChange != nil && *stateChange == "open" && s.hasPromotedPRShadow(dest, m) {
-		s.log.Debug("forgejo sink: skip reopen of promoted PR shadow issue",
-			"dest", dest.Slug(), "dest_num", existing.Index, "src_id", m.ID)
-		stateChange = nil
-	}
+	stateChange := sink.PropagateState(string(existing.State), src.State)
 	if existing.Body == body && existing.Title == src.Title && stateChange == nil {
 		s.log.Debug("forgejo sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existing.Index)
@@ -202,21 +187,15 @@ func (s *Sink) UpsertPullRequest(ctx context.Context, dest source.Repo, src sour
 }
 
 // HasPRShadow reports whether a real Forgejo PR matching the marker already
-// exists. Used by the engine to skip duplicate promotions.
-func (s *Sink) HasPRShadow(ctx context.Context, dest source.Repo, m marker.Marker) bool {
+// exists, returning its index. Used by the engine to skip duplicate promotions
+// and to find the canonical PR when retrying a pending close.
+func (s *Sink) HasPRShadow(ctx context.Context, dest source.Repo, m marker.Marker) (int64, bool) {
 	s.client.SetContext(ctx)
 	hit, _ := s.findIssueByMarker(dest, m, gitea.IssueTypePull)
-	return hit != nil
-}
-
-// hasPromotedPRShadow reports whether the issue marker m has already been
-// promoted to a real Forgejo PR (a PR shadow carrying the same source identity).
-// Context is expected to already be set on the client by the caller.
-func (s *Sink) hasPromotedPRShadow(dest source.Repo, m marker.Marker) bool {
-	prMarker := m
-	prMarker.Kind = markerKindPullRequest
-	hit, _ := s.findIssueByMarker(dest, prMarker, gitea.IssueTypePull)
-	return hit != nil
+	if hit == nil {
+		return 0, false
+	}
+	return hit.Index, true
 }
 
 // findIssueByMarker searches for an issue or PR (per kind) carrying the

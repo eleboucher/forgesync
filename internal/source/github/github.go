@@ -62,6 +62,38 @@ func (p *Provider) ListPullRequests(_ context.Context, _ source.Repo, _ source.L
 	return nil, nil
 }
 
+// GetPullRequest fetches a single PR and maps it to source.PullRequest,
+// including the head ref/SHA and merge state needed to promote it into Forgejo.
+func (p *Provider) GetPullRequest(ctx context.Context, repo source.Repo, number int64) (source.PullRequest, error) {
+	pr, _, err := p.client.PullRequests.Get(ctx, repo.Owner, repo.Name, int(number))
+	if err != nil {
+		return source.PullRequest{}, fmt.Errorf("fetch source PR: %w", err)
+	}
+	user := pr.GetUser()
+	return source.PullRequest{
+		Issue: source.Issue{
+			Number: int64(pr.GetNumber()),
+			Title:  pr.GetTitle(),
+			Body:   pr.GetBody(),
+			State:  pr.GetState(),
+			Author: source.User{
+				Login:     user.GetLogin(),
+				AvatarURL: user.GetAvatarURL(),
+				HTMLURL:   user.GetHTMLURL(),
+			},
+			HTMLURL:   pr.GetHTMLURL(),
+			CreatedAt: pr.GetCreatedAt().Time,
+			UpdatedAt: pr.GetUpdatedAt().Time,
+			ClosedAt:  closedAtPtr(pr.ClosedAt),
+		},
+		BaseBranch: pr.GetBase().GetRef(),
+		HeadBranch: pr.GetHead().GetRef(),
+		HeadSHA:    pr.GetHead().GetSHA(),
+		Merged:     pr.GetMerged(),
+		MergedAt:   closedAtPtr(pr.MergedAt),
+	}, nil
+}
+
 func (p *Provider) ListComments(ctx context.Context, repo source.Repo, issueNumber int64, opts source.ListOpts) ([]source.Comment, error) {
 	out := []source.Comment{}
 	listOpts := &gh.IssueListCommentsOptions{

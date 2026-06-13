@@ -3,7 +3,6 @@
 package githubapi
 
 import (
-	"net/url"
 	"time"
 
 	"github.com/google/go-github/v88/github"
@@ -14,7 +13,7 @@ import (
 
 // New returns a configured *github.Client. baseURL is optional; pass an
 // httptest URL for tests, "" for the public API.
-func New(token, baseURL string) *github.Client {
+func New(token, baseURL string) (*github.Client, error) {
 	rc := retryablehttp.NewClient()
 	rc.RetryMax = 3
 	rc.RetryWaitMin = 500 * time.Millisecond
@@ -22,15 +21,15 @@ func New(token, baseURL string) *github.Client {
 	rc.Logger = nil
 	rc.HTTPClient.Timeout = 30 * time.Second
 
-	gh := github.NewClient(rc.StandardClient())
+	opts := []github.ClientOptionsFunc{
+		github.WithHTTPClient(rc.StandardClient()),
+		github.WithUserAgent(version.UserAgent()),
+	}
 	if token != "" {
-		gh = gh.WithAuthToken(token)
+		opts = append(opts, github.WithAuthToken(token))
 	}
-	gh.UserAgent = version.UserAgent()
 	if baseURL != "" {
-		if u, err := url.Parse(baseURL + "/"); err == nil {
-			gh.BaseURL = u
-		}
+		opts = append(opts, github.WithURLs(&baseURL, nil))
 	}
-	return gh
+	return github.NewClient(opts...)
 }

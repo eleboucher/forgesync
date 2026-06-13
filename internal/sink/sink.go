@@ -41,24 +41,20 @@ func ShadowDrifted(shadowUpdated, sourceUpdated time.Time) bool {
 	return shadowUpdated.Sub(sourceUpdated) > shadowDriftThreshold
 }
 
-// PropagateState returns the state to apply to the shadow when it differs from
-// the source, or nil when no state PATCH is needed.
-//
-// Reopens (source open, shadow closed) always propagate. Closes (source closed,
-// shadow open) propagate only when allowClose is true — set per sink by
-// direction: canonical→mirror propagates closes, mirror→canonical does not, so
-// an external user closing a mirror issue can't close the source-of-truth issue.
-func PropagateState(existingState, srcState string, allowClose bool) *string {
-	switch {
-	case existingState == "closed" && srcState == "open":
-		s := "open"
-		return &s
-	case allowClose && existingState == "open" && srcState == "closed":
-		s := "closed"
-		return &s
-	default:
+// PropagateState returns the state the shadow should be set to so it matches
+// its source ("open" or "closed"), or nil if they already agree. Both opens and
+// closes flow. This is loop-safe because the engine only ever upserts a native
+// item into its shadow (routeIssue never treats a shadow as a source), so the
+// authoritative side's state is never overwritten by its own mirror.
+func PropagateState(existingState, srcState string) *string {
+	if existingState == srcState {
 		return nil
 	}
+	if srcState != "open" && srcState != "closed" {
+		return nil
+	}
+	s := srcState
+	return &s
 }
 
 // RenderBody composes the destination body for an issue or comment: the

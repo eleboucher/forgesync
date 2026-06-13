@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"code.gitea.io/sdk/gitea"
-	gh "github.com/google/go-github/v88/github"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/config"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/forgejoapi"
@@ -44,24 +43,56 @@ const (
 	kindPullRequest     = "pull_request"
 	syncCommand         = "/sync"
 	prTitlePrefix       = "[PR #"
+	stateOpen           = "open"
 )
+
+// forgejoClient is the canonical Forgejo SDK surface the engine drives.
+// *forgejoapi.Client satisfies it; tests substitute a fake.
+type forgejoClient interface {
+	SetContext(ctx context.Context)
+	SearchRepos(opt gitea.SearchRepoOptions) ([]*gitea.Repository, *gitea.Response, error)
+	ListPushMirrors(user, repo string, opt gitea.ListOptions) ([]*gitea.PushMirrorResponse, *gitea.Response, error)
+	ListRepoIssues(owner, repo string, opt gitea.ListIssueOption) ([]*gitea.Issue, *gitea.Response, error)
+	CreateIssueComment(owner, repo string, index int64, opt gitea.CreateIssueCommentOption) (*gitea.Comment, *gitea.Response, error)
+	EditIssue(owner, repo string, index int64, opt gitea.EditIssueOption) (*gitea.Issue, *gitea.Response, error)
+}
+
+// pullRequestSource fetches a source-forge PR for promotion (GitHub today).
+type pullRequestSource interface {
+	GetPullRequest(ctx context.Context, repo source.Repo, number int64) (source.PullRequest, error)
+}
+
+// canonicalPRSink is the canonical sink as used by the promotion path: a
+// sink.Sink that can also create real Forgejo PRs and report existing shadows.
+type canonicalPRSink interface {
+	sink.Sink
+	UpsertPullRequest(ctx context.Context, dest source.Repo, src source.PullRequest, m marker.Marker, srcGitURL, srcRef string) (int64, error)
+	HasPRShadow(ctx context.Context, dest source.Repo, m marker.Marker) (int64, bool)
+}
+
+// githubPRSink is the GitHub sink as used by the promotion path: a sink.Sink
+// that can also close a promoted PR.
+type githubPRSink interface {
+	sink.Sink
+	CommentAndClosePullRequest(ctx context.Context, dest source.Repo, number int64, comment string, m marker.Marker) error
+}
 
 // Engine is single-goroutine: tick is invoked sequentially from Run, and all
 // per-repo work happens inside that single tick. The lazy provider/sink maps
 // are therefore written without a mutex. If you ever fan out repo work across
 // goroutines, guard them.
 type Engine struct {
-	cfg       *config.Config
-	srcClient *forgejoapi.Client // typed SDK client for the canonical Forgejo
-	ghClient  *gh.Client         // for fetching full PR data when promoting
-	log       *slog.Logger
+	cfg      *config.Config
+	fjClient forgejoClient     // canonical Forgejo SDK ops
+	ghPRs    pullRequestSource // fetches GitHub PRs to promote
+	log      *slog.Logger
 
 	// Canonical Forgejo as both source (for Flow B reads) and sink (for Flow A writes).
-	canonicalSrc  *fjsource.Provider
-	canonicalSink *fjsink.Sink
+	canonicalSrc  source.Provider
+	canonicalSink canonicalPRSink
 
 	// Outbound (Flow B) sinks per host, lazily populated.
-	github       *ghsink.Sink
+	github       githubPRSink
 	forgejoSinks map[string]*fjsink.Sink
 
 	// Inbound (Flow A) sources per host, lazily populated.
@@ -76,22 +107,23 @@ func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
 	}
 	canonicalHost := hostFromURL(cfg.Source.URL)
 
-	ghClient := githubapi.New(cfg.Targets.GitHub.Token, "")
+	ghClient, err := githubapi.New(cfg.Targets.GitHub.Token, "")
+	if err != nil {
+		return nil, fmt.Errorf("github client: %w", err)
+	}
+	githubSrc := ghsource.NewWithClient(ghClient)
 
 	return &Engine{
-		cfg:          cfg,
-		srcClient:    srcClient,
-		ghClient:     ghClient,
-		log:          log,
-		canonicalSrc: fjsource.NewWithClient(srcClient, canonicalHost),
-		// canonicalSink receives mirror→canonical writes (Flow A): never let a
-		// mirror close the source-of-truth issue.
-		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log, false),
-		// github sink receives canonical→mirror writes (Flow B): propagate closes.
-		github:       ghsink.New(ghClient, log, true),
-		githubSrc:    ghsource.NewWithClient(ghClient),
-		forgejoSinks: map[string]*fjsink.Sink{},
-		forgejoSrcs:  map[string]*fjsource.Provider{},
+		cfg:           cfg,
+		fjClient:      srcClient,
+		ghPRs:         githubSrc,
+		log:           log,
+		canonicalSrc:  fjsource.NewWithClient(srcClient, canonicalHost),
+		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log),
+		github:        ghsink.New(ghClient, log),
+		githubSrc:     githubSrc,
+		forgejoSinks:  map[string]*fjsink.Sink{},
+		forgejoSrcs:   map[string]*fjsource.Provider{},
 	}, nil
 }
 
@@ -133,15 +165,15 @@ func (e *Engine) tick(parent context.Context, since time.Time) error {
 
 	// The canonical client is shared and its context is set per-call by the
 	// source/sink methods. Install this tick's context up front so the direct
-	// srcClient calls below (SearchRepos, ListPushMirrors, promotion edits) don't
+	// fjClient calls below (SearchRepos, ListPushMirrors, promotion edits) don't
 	// run under a previous tick's already-cancelled context.
-	e.srcClient.SetContext(ctx)
+	e.fjClient.SetContext(ctx)
 
 	e.log.Info("tick start", "since", since)
 
 	const repoPageSize = 50
 	for page := 1; ; page++ {
-		repos, _, err := e.srcClient.SearchRepos(gitea.SearchRepoOptions{
+		repos, _, err := e.fjClient.SearchRepos(gitea.SearchRepoOptions{
 			ListOptions: gitea.ListOptions{Page: page, PageSize: repoPageSize},
 		})
 		if err != nil {
@@ -178,7 +210,7 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 		e.log.Warn("skip repo: unexpected full name", "full_name", repo.FullName)
 		return nil
 	}
-	mirrors, _, err := e.srcClient.ListPushMirrors(owner, name, gitea.ListOptions{})
+	mirrors, _, err := e.fjClient.ListPushMirrors(owner, name, gitea.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -203,7 +235,7 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 			e.log.Error("flow B failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// /sync command flow: promote PR-shadow issues to real Forgejo PRs.
-		if err := e.detectAndPromotePRs(ctx, canonical, host, target, since); err != nil {
+		if err := e.detectAndPromotePRs(ctx, canonical, host, target); err != nil {
 			e.log.Error("PR promotion pass failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 	}
@@ -213,12 +245,12 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 // detectAndPromotePRs looks for [PR #N] shadow issues with a /sync comment and
 // promotes them to real Forgejo PRs. Only runs for github.com targets.
 // /sync must be posted on canonical Forgejo (trust check: user owns that forge).
-func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo, host string, target source.Repo, since time.Time) error {
+func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo, host string, target source.Repo) error {
 	if host != githubHost {
 		return nil
 	}
 
-	issues, err := e.canonicalSrc.ListIssues(ctx, canonical, source.ListOpts{Since: since})
+	issues, err := e.listOpenCanonicalIssues(canonical)
 	if err != nil {
 		return err
 	}
@@ -245,9 +277,15 @@ func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo,
 			Type: m.Type, Host: m.Host, Repo: m.Repo,
 			Kind: kindPullRequest, ID: m.ID,
 		}
-		if e.canonicalSink.HasPRShadow(ctx, canonical, prMarker) {
-			e.log.Debug("PR already promoted, skip",
-				"canonical_iss", iss.Number, "src_pr", m.ID)
+		if destNum, ok := e.canonicalSink.HasPRShadow(ctx, canonical, prMarker); ok {
+			// Already promoted, but the shadow issue is still open (we only list
+			// open issues), so an earlier close didn't complete — e.g. a
+			// transient GitHub error closing the source PR. Retry it; HasPRShadow
+			// short-circuiting on a partial close would otherwise leave the
+			// redundant GitHub PR open forever.
+			e.log.Debug("PR already promoted, retrying pending close",
+				"canonical_iss", iss.Number, "src_pr", m.ID, "canonical_pr", destNum)
+			e.closePromotedPR(ctx, canonical, target, iss.Number, m, prMarker, destNum)
 			continue
 		}
 
@@ -259,41 +297,52 @@ func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo,
 	return nil
 }
 
-// promotePR creates a real Forgejo PR from a [PR #N] shadow issue.
-//
-// Side-effect: pushing forgesync/pr-N to Forgejo triggers push-mirror, which
-// runs git push --mirror and deletes refs absent locally. If the PR head branch
-// only exists on GitHub (external contributor), push-mirror will delete it and
-// GitHub will auto-close the PR. We don't pre-mirror it because that lands
-// untrusted code on the canonical forge as a normal branch.
-func (e *Engine) promotePR(ctx context.Context, canonical, target source.Repo, iss source.Issue, issMarker, prMarker marker.Marker) error {
-	pr, _, err := e.ghClient.PullRequests.Get(ctx, target.Owner, target.Name, int(issMarker.ID))
-	if err != nil {
-		return fmt.Errorf("fetch source PR: %w", err)
+// listOpenCanonicalIssues lists all OPEN issues in the canonical repo, NOT
+// bounded by the poll look-back window. The /sync promotion trigger must not
+// depend on recency: a /sync comment is a durable intent, and gating detection
+// on the window means a command posted while the daemon was busy or restarting
+// (e.g. outside the InitialBackfill) is lost forever once the issue ages out.
+// Promoted shadows are closed by promotePR, so the open set stays small.
+func (e *Engine) listOpenCanonicalIssues(canonical source.Repo) ([]source.Issue, error) {
+	const pageSize = 50
+	var out []source.Issue
+	for page := 1; ; page++ {
+		batch, _, err := e.fjClient.ListRepoIssues(canonical.Owner, canonical.Name, gitea.ListIssueOption{
+			ListOptions: gitea.ListOptions{Page: page, PageSize: pageSize},
+			State:       gitea.StateOpen,
+			Type:        gitea.IssueTypeIssue,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, i := range batch {
+			out = append(out, source.Issue{
+				Number: i.Index,
+				Title:  i.Title,
+				Body:   strings.TrimSpace(i.Body),
+			})
+		}
+		if len(batch) < pageSize {
+			break
+		}
 	}
+	return out, nil
+}
 
-	user := pr.GetUser()
-	srcPR := source.PullRequest{
-		Issue: source.Issue{
-			Number: int64(pr.GetNumber()),
-			Title:  pr.GetTitle(),
-			Body:   pr.GetBody(),
-			State:  pr.GetState(),
-			Author: source.User{
-				Login:     user.GetLogin(),
-				AvatarURL: user.GetAvatarURL(),
-				HTMLURL:   user.GetHTMLURL(),
-			},
-			HTMLURL:   pr.GetHTMLURL(),
-			CreatedAt: pr.GetCreatedAt().Time,
-			UpdatedAt: pr.GetUpdatedAt().Time,
-			ClosedAt:  timestampPtr(pr.ClosedAt),
-		},
-		BaseBranch: pr.GetBase().GetRef(),
-		HeadBranch: pr.GetHead().GetRef(),
-		HeadSHA:    pr.GetHead().GetSHA(),
-		Merged:     pr.GetMerged(),
-		MergedAt:   timestampPtr(pr.MergedAt),
+// promotePR creates a real Forgejo PR from a [PR #N] shadow issue, then closes
+// both the canonical shadow issue and the source GitHub PR (the canonical PR is
+// now the source of truth).
+//
+// The GitHub PR is closed explicitly via the API. We can't rely on push-mirror
+// to do it: mirroring forgesync/pr-N is an additive push, so it never prunes
+// the PR's head branch and GitHub never auto-closes the PR.
+func (e *Engine) promotePR(ctx context.Context, canonical, target source.Repo, iss source.Issue, issMarker, prMarker marker.Marker) error {
+	srcPR, err := e.ghPRs.GetPullRequest(ctx, target, issMarker.ID)
+	if err != nil {
+		return err
 	}
 
 	srcGitURL := fmt.Sprintf("https://%s/%s/%s.git", githubHost, target.Owner, target.Name)
@@ -311,20 +360,63 @@ func (e *Engine) promotePR(ctx context.Context, canonical, target source.Repo, i
 		return fmt.Errorf("upsert PR: %w", err)
 	}
 
-	// Post a "Promoted to #X" notice on the original issue and close it.
+	// Post a "Promoted to #X" notice on the original issue. The notice carries
+	// the marker so Flow B (canonical→github) filters it out instead of echoing
+	// it onto the GitHub PR.
 	notice := fmt.Sprintf("Promoted to #%d. Future updates will sync to that PR.", destNum)
-	if _, _, err := e.srcClient.CreateIssueComment(canonical.Owner, canonical.Name, iss.Number, gitea.CreateIssueCommentOption{Body: notice}); err != nil {
+	if _, _, err := e.fjClient.CreateIssueComment(canonical.Owner, canonical.Name, iss.Number, gitea.CreateIssueCommentOption{
+		Body: marker.WithMarker(notice, prMarker),
+	}); err != nil {
 		e.log.Warn("post promotion notice failed", "iss", iss.Number, "err", err)
 	}
-	closed := gitea.StateClosed
-	if _, _, err := e.srcClient.EditIssue(canonical.Owner, canonical.Name, iss.Number, gitea.EditIssueOption{
-		State: &closed,
-	}); err != nil {
-		e.log.Warn("close promoted issue failed", "iss", iss.Number, "err", err)
-	}
+
+	e.closePromotedPR(ctx, canonical, target, iss.Number, issMarker, prMarker, destNum)
+
 	e.log.Info("promoted PR",
 		"canonical_iss", iss.Number, "src_pr", issMarker.ID, "canonical_pr", destNum)
 	return nil
+}
+
+// closePromotedPR closes the source GitHub PR (when still open) and then the
+// canonical shadow issue. It runs at promotion time and is re-run on later ticks
+// as a retry: if an earlier attempt left the GitHub side open (transient error),
+// detectAndPromotePRs calls this again rather than skipping the already-promoted
+// shadow.
+//
+// The GitHub PR is closed first, pointing reviewers at the canonical PR. The
+// shadow's open/closed state tracks this GitHub PR via Flow A's state
+// propagation, so we must NOT close the shadow while the PR is still open — the
+// next tick would just reopen it. Only close the shadow once the GitHub side is
+// closed (already merged/closed, or closed here). It re-reads the PR state so
+// the retry path doesn't act on stale data.
+func (e *Engine) closePromotedPR(ctx context.Context, canonical, target source.Repo, issNum int64, issMarker, prMarker marker.Marker, destNum int64) {
+	srcPR, err := e.ghPRs.GetPullRequest(ctx, target, issMarker.ID)
+	if err != nil {
+		e.log.Warn("re-check source PR state failed", "src_pr", issMarker.ID, "err", err)
+		return
+	}
+
+	ghClosed := srcPR.State != stateOpen
+	if srcPR.State == stateOpen {
+		ghNotice := fmt.Sprintf("Promoted to the canonical Forgejo repository (PR #%d), which is the source of truth. Further review and merging happen there.", destNum)
+		if err := e.github.CommentAndClosePullRequest(ctx, target, issMarker.ID, ghNotice, prMarker); err != nil {
+			e.log.Warn("close source GitHub PR failed", "src_pr", issMarker.ID, "err", err)
+		} else {
+			ghClosed = true
+		}
+	}
+	if !ghClosed {
+		e.log.Warn("leaving promoted shadow issue open until source GitHub PR closes",
+			"iss", issNum, "src_pr", issMarker.ID)
+		return
+	}
+
+	closed := gitea.StateClosed
+	if _, _, err := e.fjClient.EditIssue(canonical.Owner, canonical.Name, issNum, gitea.EditIssueOption{
+		State: &closed,
+	}); err != nil {
+		e.log.Warn("close promoted issue failed", "iss", issNum, "err", err)
+	}
 }
 
 // hasSyncCommand reports whether any non-bot comment is the `/sync` slash
@@ -508,8 +600,7 @@ func (e *Engine) sinkForHost(host string) (sink.Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("forgejo client for %s: %w", host, err)
 	}
-	// Outbound (Flow B) sink: propagate closes canonical→mirror.
-	s := fjsink.New(client, e.cfg.Bot.Username, e.log, true)
+	s := fjsink.New(client, e.cfg.Bot.Username, e.log)
 	e.forgejoSinks[host] = s
 	return s, nil
 }
@@ -562,14 +653,6 @@ func hostFromURL(s string) string {
 		return ""
 	}
 	return strings.ToLower(u.Host)
-}
-
-func timestampPtr(t *gh.Timestamp) *time.Time {
-	if t == nil {
-		return nil
-	}
-	tm := t.Time
-	return &tm
 }
 
 func normalizeHostForEnv(host string) string {

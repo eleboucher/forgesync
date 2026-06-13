@@ -30,15 +30,14 @@ const (
 )
 
 func newSink(t *testing.T, h http.HandlerFunc) *Sink {
-	return newSinkCloses(t, h, true)
-}
-
-func newSinkCloses(t *testing.T, h http.HandlerFunc, propagateCloses bool) *Sink {
 	t.Helper()
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
-	c := githubapi.New("test-token", ts.URL)
-	return New(c, slog.New(slog.NewTextHandler(io.Discard, nil)), propagateCloses)
+	c, err := githubapi.New("test-token", ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(c, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func testRepo() source.Repo { return source.Repo{Owner: testRepoOwner, Name: testRepoName} }
@@ -149,35 +148,77 @@ func TestUpsertIssue_PATCHReopens(t *testing.T) {
 	}
 }
 
-func TestUpsertIssue_PATCHDoesNotClose(t *testing.T) {
-	// Inbound sink (propagateCloses=false): shadow open, source closed → DO NOT
-	// propagate the close.
+func TestUpsertIssue_PATCHCloses(t *testing.T) {
+	// Shadow is open, source is closed → propagate the close.
 	m := testMarker()
 	now := time.Now()
 	existing := &gh.Issue{
 		Number:    gh.Ptr(5),
-		Title:     gh.Ptr("hi"),                   // matches src title
-		Body:      gh.Ptr("old\n\n" + m.String()), // body differs to force PATCH
+		Title:     gh.Ptr("hi"), // matches src title; close alone forces the PATCH
+		Body:      gh.Ptr(renderIssueBody(testIssue(stateClosed, now), m)),
 		State:     gh.Ptr(stateOpen),
 		UpdatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
 	}
-	var stateField *string
-	sink := newSinkCloses(t, func(w http.ResponseWriter, r *http.Request) {
+	var sentState string
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == searchPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
 		case r.Method == http.MethodPatch:
 			var req gh.IssueRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			stateField = req.State
+			if req.State != nil {
+				sentState = *req.State
+			}
 			_ = json.NewEncoder(w).Encode(&gh.Issue{Number: gh.Ptr(5)})
 		}
-	}, false)
+	})
 	if _, err := sink.UpsertIssue(context.Background(), testRepo(), testIssue(stateClosed, now), m); err != nil {
 		t.Fatal(err)
 	}
-	if stateField != nil {
-		t.Errorf("PATCH must NOT send state on close transition, got %q", *stateField)
+	if sentState != stateClosed {
+		t.Errorf("PATCH must send state=closed on close transition, got %q", sentState)
+	}
+}
+
+func TestCommentAndClosePullRequest(t *testing.T) {
+	m := testMarker()
+	var (
+		commentBody string
+		closeState  string
+		commented   atomic.Int32
+		closed      atomic.Int32
+	)
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
+			commented.Add(1)
+			var req gh.IssueComment
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			commentBody = req.GetBody()
+			_ = json.NewEncoder(w).Encode(&gh.IssueComment{ID: gh.Ptr(int64(1))})
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/pulls/"):
+			closed.Add(1)
+			var req gh.PullRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			closeState = req.GetState()
+			_ = json.NewEncoder(w).Encode(&gh.PullRequest{Number: gh.Ptr(7)})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	if err := sink.CommentAndClosePullRequest(context.Background(), testRepo(), 7, "Promoted.", m); err != nil {
+		t.Fatal(err)
+	}
+	if commented.Load() != 1 || closed.Load() != 1 {
+		t.Fatalf("commented=%d closed=%d (want 1,1)", commented.Load(), closed.Load())
+	}
+	if closeState != stateClosed {
+		t.Errorf("PATCH must send state=closed, got %q", closeState)
+	}
+	if !strings.Contains(commentBody, m.String()) {
+		t.Errorf("comment must carry the marker so it isn't echoed back, got: %q", commentBody)
 	}
 }
 
