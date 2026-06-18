@@ -27,7 +27,7 @@ jobs:
   container:
     runs-on: docker
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7
       - uses: https://data.forgejo.org/docker/setup-buildx-action@v4
       - name: Login to git.erwanleboucher.dev
         uses: https://data.forgejo.org/docker/login-action@v4
