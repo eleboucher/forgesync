@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	code.gitea.io/sdk/gitea v0.25.1
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/google/go-github/v89 v89.0.0
+	github.com/google/go-github/v90 v90.0.0
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/joho/godotenv v1.5.1
 	github.com/spf13/cobra v1.10.2
