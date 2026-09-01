@@ -99,7 +99,7 @@ func TestUpsertIssue_CreateClosedDoesPatch(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(&gh.Issue{Number: gh.Ptr(5)})
 		case r.Method == http.MethodPatch:
 			patches.Add(1)
-			var req gh.IssueRequest
+			var req gh.UpdateIssueRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.State == nil || *req.State != stateClosed {
 				t.Errorf("expected state=closed in PATCH, got %+v", req.State)
@@ -132,7 +132,7 @@ func TestUpsertIssue_PATCHReopens(t *testing.T) {
 		case r.URL.Path == searchPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
 		case r.Method == http.MethodPatch:
-			var req gh.IssueRequest
+			var req gh.UpdateIssueRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.State != nil {
 				sentState = *req.State
@@ -165,7 +165,7 @@ func TestUpsertIssue_PATCHCloses(t *testing.T) {
 		case r.URL.Path == searchPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
 		case r.Method == http.MethodPatch:
-			var req gh.IssueRequest
+			var req gh.UpdateIssueRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.State != nil {
 				sentState = *req.State
@@ -240,7 +240,7 @@ func TestUpsertIssue_PATCHPropagatesClose(t *testing.T) {
 		case r.URL.Path == searchPath:
 			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
 		case r.Method == http.MethodPatch:
-			var req gh.IssueRequest
+			var req gh.UpdateIssueRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			if req.State != nil {
 				sentState = *req.State

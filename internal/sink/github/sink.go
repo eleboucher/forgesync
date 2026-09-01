@@ -45,8 +45,8 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	if existing == nil {
-		created, _, err := s.client.Issues.Create(ctx, dest.Owner, dest.Name, &gh.IssueRequest{
-			Title: gh.Ptr(src.Title),
+		created, _, err := s.client.Issues.Create(ctx, dest.Owner, dest.Name, gh.CreateIssueRequest{
+			Title: src.Title,
 			Body:  gh.Ptr(body),
 		})
 		if err != nil {
@@ -58,7 +58,7 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		// GitHub's create endpoint always opens the issue. If the source is
 		// already closed, send a follow-up PATCH.
 		if src.State == stateClosed {
-			if _, _, err := s.client.Issues.Edit(ctx, dest.Owner, dest.Name, created.GetNumber(), &gh.IssueRequest{
+			if _, _, err := s.client.Issues.Update(ctx, dest.Owner, dest.Name, created.GetNumber(), gh.UpdateIssueRequest{
 				State: gh.Ptr(stateClosed),
 			}); err != nil {
 				return 0, fmt.Errorf("close newly created issue: %w", err)
@@ -87,14 +87,14 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 
 	// State tracks the source both ways (open and closed). Safe because we only
 	// ever PATCH a shadow from its native source, never the other way around.
-	editReq := &gh.IssueRequest{
+	editReq := &gh.UpdateIssueRequest{
 		Title: gh.Ptr(src.Title),
 		Body:  gh.Ptr(body),
 	}
 	if stateChange != nil {
 		editReq.State = stateChange
 	}
-	if _, _, err := s.client.Issues.Edit(ctx, dest.Owner, dest.Name, existing.GetNumber(), editReq); err != nil {
+	if _, _, err := s.client.Issues.Update(ctx, dest.Owner, dest.Name, existing.GetNumber(), *editReq); err != nil {
 		return 0, fmt.Errorf("edit issue: %w", err)
 	}
 	if stateChange != nil {
