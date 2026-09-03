@@ -5,7 +5,7 @@ package githubapi
 import (
 	"time"
 
-	"github.com/google/go-github/v90/github"
+	"github.com/google/go-github/v91/github"
 	"github.com/hashicorp/go-retryablehttp"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/version"

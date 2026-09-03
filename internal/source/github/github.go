@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	gh "github.com/google/go-github/v90/github"
+	gh "github.com/google/go-github/v91/github"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
