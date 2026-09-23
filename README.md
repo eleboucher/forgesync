@@ -2,7 +2,7 @@
 
 You self-host Forgejo and push-mirror your repos out to GitHub for visibility. External users land on the GitHub mirror and file issues there. Those issues never make it back into your forge.
 
-forgesync closes that loop. It reads the push-mirror config from each repo in your Forgejo, polls every mirror target, and writes new issues, comments, and edits back into the source-of-truth Forgejo.
+forgesync closes that loop. It reads the push-mirror config from each repo in your Forgejo, polls every mirror target, and writes new issues, comments, edits, and labels back into the source-of-truth Forgejo. Labels are matched by name, and any the destination doesn't have yet are created. forgesync only ever removes labels it set itself, so labels added on the other side stay put.
 
 forgesync is **stateless**: every issue and comment it creates carries an HTML-comment marker in the body, and that marker is the only state.
 

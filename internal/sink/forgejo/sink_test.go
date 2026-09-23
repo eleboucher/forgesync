@@ -48,6 +48,12 @@ func newSink(t *testing.T, h http.HandlerFunc) *Sink {
 func testRepo() source.Repo { return source.Repo{Owner: testRepoOwner, Name: testRepoName} }
 
 const (
+	lOld    = "old"
+	lTriage = "triage"
+	lBug    = "bug"
+)
+
+const (
 	stateOpen   = gitea.StateOpen
 	stateClosed = gitea.StateClosed
 )
@@ -187,6 +193,151 @@ func TestUpsertIssue_PATCHCloses(t *testing.T) {
 	}
 	if sentState != stateClosed {
 		t.Errorf("PATCH must send state=closed on close transition, got %q", sentState)
+	}
+}
+
+// labelServer serves a shadow issue, the repo's labels, label creation and
+// label replacement, recording what was created and the replaced ID set.
+type labelServer struct {
+	existing  *gitea.Issue
+	repo      []*gitea.Label
+	createErr bool
+	created   []string
+	replaced  string
+	patches   atomic.Int32
+}
+
+func (ls *labelServer) handle(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/issues"):
+			_ = json.NewEncoder(w).Encode([]*gitea.Issue{ls.existing})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/labels"):
+			_ = json.NewEncoder(w).Encode(ls.repo)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/labels"):
+			if ls.createErr {
+				http.Error(w, `{"message":"boom"}`, http.StatusUnprocessableEntity)
+				return
+			}
+			var req gitea.CreateLabelOption
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			ls.created = append(ls.created, req.Name)
+			_ = json.NewEncoder(w).Encode(&gitea.Label{ID: 100 + int64(len(ls.created)), Name: req.Name})
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/labels"):
+			b, _ := io.ReadAll(r.Body)
+			ls.replaced = strings.TrimSpace(string(b))
+			_ = json.NewEncoder(w).Encode([]*gitea.Label{})
+		case r.Method == http.MethodPatch:
+			ls.patches.Add(1)
+			_ = json.NewEncoder(w).Encode(&gitea.Issue{Index: ls.existing.Index})
+		default:
+			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
+		}
+	}
+}
+
+func TestUpsertIssue_SyncsLabels(t *testing.T) {
+	// forgesync set "old" last time and the source has since dropped it, so it
+	// goes. "triage" was added on Forgejo, so it stays. "Bug" matches the repo's
+	// "bug", "ui" is created.
+	m := testMarker()
+	now := time.Now()
+	prev := testIssue(stateOpen, now)
+	prev.Labels = []string{lOld}
+	src := testIssue(stateOpen, now)
+	src.Labels = []string{"Bug", "ui"}
+	ls := &labelServer{
+		existing: &gitea.Issue{
+			Index:   7,
+			Title:   src.Title,
+			Body:    renderIssueBody(prev, m),
+			State:   stateOpen,
+			Labels:  []*gitea.Label{{ID: 1, Name: lOld}, {ID: 2, Name: lTriage}},
+			Updated: now.Add(-time.Hour),
+		},
+		repo: []*gitea.Label{{ID: 1, Name: lOld}, {ID: 2, Name: lTriage}, {ID: 3, Name: lBug}},
+	}
+	sink := newSink(t, ls.handle(t))
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if len(ls.created) != 1 || ls.created[0] != "ui" {
+		t.Errorf("expected only the missing label to be created, got %v", ls.created)
+	}
+	if ls.replaced != `{"labels":[2,3,101]}` {
+		t.Errorf("replaced labels = %s, want triage, bug and the new ui", ls.replaced)
+	}
+	if ls.patches.Load() != 1 {
+		t.Errorf("the body records the synced labels, so it must be patched once, got %d", ls.patches.Load())
+	}
+}
+
+func TestUpsertIssue_KeepsDestinationLabelsOnOldShadows(t *testing.T) {
+	// A shadow from before label sync has no record, so nothing is removed.
+	m := testMarker()
+	now := time.Now()
+	src := testIssue(stateOpen, now)
+	src.Labels = []string{lBug}
+	ls := &labelServer{
+		existing: &gitea.Issue{
+			Index: 7, Title: src.Title, Body: "old body\n\n" + m.String(), State: stateOpen,
+			Labels:  []*gitea.Label{{ID: 2, Name: lTriage}},
+			Updated: now.Add(-time.Hour),
+		},
+		repo: []*gitea.Label{{ID: 2, Name: lTriage}, {ID: 3, Name: lBug}},
+	}
+	sink := newSink(t, ls.handle(t))
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if ls.replaced != `{"labels":[2,3]}` {
+		t.Errorf("replaced labels = %s, want triage kept and bug added", ls.replaced)
+	}
+}
+
+func TestUpsertIssue_ClearsSyncedLabels(t *testing.T) {
+	m := testMarker()
+	now := time.Now()
+	prev := testIssue(stateOpen, now)
+	prev.Labels = []string{lBug}
+	src := testIssue(stateOpen, now)
+	ls := &labelServer{
+		existing: &gitea.Issue{
+			Index: 7, Title: src.Title, Body: renderIssueBody(prev, m), State: stateOpen,
+			Labels:  []*gitea.Label{{ID: 1, Name: lBug}},
+			Updated: now.Add(-time.Hour),
+		},
+	}
+	sink := newSink(t, ls.handle(t))
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if ls.replaced != `{"labels":[]}` {
+		t.Errorf("expected an empty label list to clear labels, got %s", ls.replaced)
+	}
+}
+
+func TestUpsertIssue_LabelFailureDoesNotBlockIssue(t *testing.T) {
+	m := testMarker()
+	now := time.Now()
+	src := testIssue(stateOpen, now)
+	src.Labels = []string{"way-too-weird"}
+	ls := &labelServer{
+		existing: &gitea.Issue{
+			Index: 7, Title: "old title", Body: "old body\n\n" + m.String(), State: stateOpen,
+			Updated: now.Add(-time.Hour),
+		},
+		createErr: true,
+	}
+	sink := newSink(t, ls.handle(t))
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatalf("a label failure must not fail the upsert, got %v", err)
+	}
+	if ls.patches.Load() != 1 {
+		t.Errorf("title/body must still be patched, got %d", ls.patches.Load())
+	}
+	if ls.replaced != "" {
+		t.Errorf("labels must not be replaced after a failed create, got %s", ls.replaced)
 	}
 }
 

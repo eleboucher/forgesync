@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"code.gitea.io/sdk/gitea"
@@ -46,10 +47,18 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	if existing == nil {
+		labelIDs, err := s.labelIDs(dest, src.Labels, nil)
+		if err != nil {
+			// A label we can't create shouldn't hold back the issue itself.
+			s.log.Warn("forgejo sink: creating issue without labels",
+				"dest", dest.Slug(), "marker_id", m.ID, "err", err)
+			labelIDs = nil
+		}
 		created, _, err := s.client.CreateIssue(dest.Owner, dest.Name, gitea.CreateIssueOption{
 			Title:  src.Title,
 			Body:   body,
 			Closed: src.State == "closed",
+			Labels: labelIDs,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("create issue: %w", err)
@@ -60,7 +69,11 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	stateChange := sink.PropagateState(string(existing.State), src.State)
-	if existing.Body == body && existing.Title == src.Title && stateChange == nil {
+	contentChanged := existing.Body != body || existing.Title != src.Title || stateChange != nil
+	current := labelNames(existing.Labels)
+	wantLabels := sink.ShadowLabels(current, sink.SyncedLabels(existing.Body), src.Labels)
+	labelsChanged := !sink.LabelsEqual(current, wantLabels)
+	if !contentChanged && !labelsChanged {
 		s.log.Debug("forgejo sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existing.Index)
 		return existing.Index, nil
@@ -75,25 +88,106 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 		return existing.Index, nil
 	}
 
-	editOpt := gitea.EditIssueOption{
-		Title: src.Title,
-		Body:  &body,
+	if contentChanged {
+		editOpt := gitea.EditIssueOption{
+			Title: src.Title,
+			Body:  &body,
+		}
+		if stateChange != nil {
+			st := gitea.StateType(*stateChange)
+			editOpt.State = &st
+		}
+		if _, _, err := s.client.EditIssue(dest.Owner, dest.Name, existing.Index, editOpt); err != nil {
+			return 0, fmt.Errorf("edit issue: %w", err)
+		}
+		if stateChange != nil {
+			s.log.Info("forgejo sink: synced issue state",
+				"dest", dest.Slug(), "dest_num", existing.Index, "state", *stateChange)
+		} else {
+			s.log.Debug("forgejo sink: patched issue (title/body)",
+				"dest", dest.Slug(), "dest_num", existing.Index)
+		}
 	}
-	if stateChange != nil {
-		st := gitea.StateType(*stateChange)
-		editOpt.State = &st
-	}
-	if _, _, err := s.client.EditIssue(dest.Owner, dest.Name, existing.Index, editOpt); err != nil {
-		return 0, fmt.Errorf("edit issue: %w", err)
-	}
-	if stateChange != nil {
-		s.log.Info("forgejo sink: synced issue state",
-			"dest", dest.Slug(), "dest_num", existing.Index, "state", *stateChange)
-	} else {
-		s.log.Debug("forgejo sink: patched issue (title/body)",
-			"dest", dest.Slug(), "dest_num", existing.Index)
+	if labelsChanged {
+		labelIDs, err := s.labelIDs(dest, wantLabels, existing.Labels)
+		if err == nil {
+			_, _, err = s.client.ReplaceIssueLabels(dest.Owner, dest.Name, existing.Index, gitea.IssueLabelsOption{
+				Labels: labelIDs,
+			})
+		}
+		if err != nil {
+			// Logged, not returned: a label problem shouldn't block the issue's comments.
+			s.log.Warn("forgejo sink: label sync failed",
+				"dest", dest.Slug(), "dest_num", existing.Index, "err", err)
+		} else {
+			s.log.Debug("forgejo sink: synced issue labels",
+				"dest", dest.Slug(), "dest_num", existing.Index, "labels", wantLabels)
+		}
 	}
 	return existing.Index, nil
+}
+
+// labelIDs resolves label names to label IDs, creating any label the repo
+// doesn't have yet. known seeds the lookup with labels already on the issue,
+// so an org-level label there is reused rather than duplicated in the repo.
+// Names match case-insensitively.
+func (s *Sink) labelIDs(dest source.Repo, names []string, known []*gitea.Label) ([]int64, error) {
+	ids := make([]int64, 0, len(names))
+	if len(names) == 0 {
+		return ids, nil
+	}
+	byName, err := s.repoLabels(dest)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range known {
+		byName[strings.ToLower(l.Name)] = l
+	}
+	for _, name := range names {
+		if l, ok := byName[strings.ToLower(name)]; ok {
+			ids = append(ids, l.ID)
+			continue
+		}
+		created, _, err := s.client.CreateLabel(dest.Owner, dest.Name, gitea.CreateLabelOption{
+			Name:  name,
+			Color: "#" + sink.LabelColor,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create label %q: %w", name, err)
+		}
+		s.log.Info("forgejo sink: created label", "dest", dest.Slug(), "label", name)
+		byName[strings.ToLower(name)] = created
+		ids = append(ids, created.ID)
+	}
+	return ids, nil
+}
+
+func (s *Sink) repoLabels(dest source.Repo) (map[string]*gitea.Label, error) {
+	const pageSize = 50
+	out := map[string]*gitea.Label{}
+	for page := 1; ; page++ {
+		batch, _, err := s.client.ListRepoLabels(dest.Owner, dest.Name, gitea.ListLabelsOptions{
+			ListOptions: gitea.ListOptions{Page: page, PageSize: pageSize},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list labels: %w", err)
+		}
+		for _, l := range batch {
+			out[strings.ToLower(l.Name)] = l
+		}
+		if len(batch) < pageSize {
+			break
+		}
+	}
+	return out, nil
+}
+
+func labelNames(labels []*gitea.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, l.Name)
+	}
+	return names
 }
 
 func (s *Sink) UpsertComment(ctx context.Context, dest source.Repo, destIssueNumber int64, src source.Comment, m marker.Marker) error {
@@ -264,7 +358,8 @@ func (s *Sink) findCommentByMarker(dest source.Repo, issueNumber int64, m marker
 }
 
 func renderIssueBody(src source.Issue, m marker.Marker) string {
-	return sink.RenderBody(src.Author, src.HTMLURL, src.CreatedAt, src.Body, m, bodyLimit)
+	body := sink.RenderBody(src.Author, src.HTMLURL, src.CreatedAt, src.Body, m, bodyLimit)
+	return sink.WithSyncedLabels(body, src.Labels)
 }
 
 func renderCommentBody(src source.Comment, m marker.Marker) string {

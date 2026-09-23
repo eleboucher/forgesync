@@ -5,6 +5,9 @@ package sink
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -55,6 +58,98 @@ func PropagateState(existingState, srcState string) *string {
 	}
 	s := srcState
 	return &s
+}
+
+// LabelColor is the color given to labels a sink has to create on the
+// destination, since the source only tells us the label's name.
+const LabelColor = "ededed"
+
+var syncedLabelsRe = regexp.MustCompile(`<!-- forgesync:labels=(\S*) -->`)
+
+// WithSyncedLabels appends a hidden note listing the labels forgesync set on a
+// shadow, so a later sync can tell them apart from labels people added on the
+// destination. Nothing is appended when there are none.
+func WithSyncedLabels(body string, labels []string) string {
+	labels = uniqueLabels(labels)
+	if len(labels) == 0 {
+		return body
+	}
+	escaped := make([]string, len(labels))
+	for i, l := range labels {
+		escaped[i] = url.QueryEscape(l)
+	}
+	return body + "\n<!-- forgesync:labels=" + strings.Join(escaped, ",") + " -->"
+}
+
+// SyncedLabels returns the labels recorded in body by WithSyncedLabels.
+func SyncedLabels(body string) []string {
+	m := syncedLabelsRe.FindStringSubmatch(body)
+	if m == nil || m[1] == "" {
+		return nil
+	}
+	var out []string
+	for part := range strings.SplitSeq(m[1], ",") {
+		if l, err := url.QueryUnescape(part); err == nil && l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// ShadowLabels returns the labels a shadow should carry: its current labels,
+// minus the ones forgesync set earlier that the source has since dropped, plus
+// the source's. Labels people added on the destination are left alone.
+func ShadowLabels(current, previouslySynced, src []string) []string {
+	src = uniqueLabels(src)
+	wanted := foldSet(src)
+	dropped := foldSet(previouslySynced)
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range slices.Concat(current, src) {
+		k := strings.ToLower(l)
+		if seen[k] || (dropped[k] && !wanted[k]) {
+			continue
+		}
+		seen[k] = true
+		out = append(out, l)
+	}
+	return out
+}
+
+// LabelsEqual reports whether a and b hold the same label names, ignoring
+// order, case and duplicates (GitHub treats label names case-insensitively).
+func LabelsEqual(a, b []string) bool {
+	sa, sb := foldSet(a), foldSet(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for k := range sa {
+		if !sb[k] {
+			return false
+		}
+	}
+	return true
+}
+
+func foldSet(labels []string) map[string]bool {
+	set := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		set[strings.ToLower(l)] = true
+	}
+	return set
+}
+
+// uniqueLabels drops case-insensitive duplicates, keeping the first spelling.
+func uniqueLabels(labels []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range labels {
+		if k := strings.ToLower(l); !seen[k] {
+			seen[k] = true
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // RenderBody composes the destination body for an issue or comment: the

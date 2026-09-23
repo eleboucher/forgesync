@@ -27,6 +27,7 @@ const (
 	testRepoName   = "hi"
 	testAuthor     = "alice"
 	testSourceHTML = "https://git.example.com/me/proj/issues/11"
+	lStale         = "stale"
 )
 
 func newSink(t *testing.T, h http.HandlerFunc) *Sink {
@@ -145,6 +146,64 @@ func TestUpsertIssue_PATCHReopens(t *testing.T) {
 	}
 	if sentState != stateOpen {
 		t.Errorf("PATCH must send state=open on reopen, got %q", sentState)
+	}
+}
+
+func TestUpsertIssue_PATCHSyncsLabels(t *testing.T) {
+	// forgesync set "stale" last time and the source has dropped it, so it goes.
+	// "triage" was added on GitHub, so it stays. The missing "ui" is created.
+	m := testMarker()
+	now := time.Now()
+	prev := testIssue(stateOpen, now)
+	prev.Labels = []string{lStale}
+	src := testIssue(stateOpen, now)
+	src.Labels = []string{"Bug", "ui"}
+	existing := &gh.Issue{
+		Number:    gh.Ptr(5),
+		Title:     gh.Ptr(src.Title),
+		Body:      gh.Ptr(renderIssueBody(prev, m)),
+		State:     gh.Ptr(stateOpen),
+		Labels:    []*gh.Label{{Name: lStale}, {Name: "triage"}},
+		UpdatedAt: &gh.Timestamp{Time: now.Add(-time.Hour)},
+	}
+	var (
+		created []string
+		sent    []string
+		patches atomic.Int32
+	)
+	sink := newSink(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == searchPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{itemsKey: []*gh.Issue{existing}})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/labels"):
+			_ = json.NewEncoder(w).Encode([]*gh.Label{{Name: lStale}, {Name: "triage"}, {Name: "bug"}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/labels"):
+			var req gh.CreateIssueLabelRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			created = append(created, req.Name)
+			_ = json.NewEncoder(w).Encode(&gh.Label{Name: req.Name})
+		case r.Method == http.MethodPatch:
+			patches.Add(1)
+			var req gh.UpdateIssueRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			sent = req.Labels
+			_ = json.NewEncoder(w).Encode(&gh.Issue{Number: gh.Ptr(5)})
+		default:
+			t.Errorf("unexpected: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	if _, err := sink.UpsertIssue(context.Background(), testRepo(), src, m); err != nil {
+		t.Fatal(err)
+	}
+	if patches.Load() != 1 {
+		t.Fatalf("expected 1 PATCH, got %d", patches.Load())
+	}
+	if len(created) != 1 || created[0] != "ui" {
+		t.Errorf("expected only the missing label to be created, got %v", created)
+	}
+	// "Bug" resolves to the existing "bug" rather than creating a duplicate.
+	if strings.Join(sent, ",") != "triage,bug,ui" {
+		t.Errorf("PATCH labels = %v, want [triage bug ui]", sent)
 	}
 }
 

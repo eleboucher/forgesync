@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	gh "github.com/google/go-github/v92/github"
@@ -45,9 +46,17 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 
 	if existing == nil {
+		labels, err := s.ensureLabels(ctx, dest, src.Labels)
+		if err != nil {
+			// A label we can't create shouldn't hold back the issue itself.
+			s.log.Warn("github sink: creating issue without labels",
+				"dest", dest.Slug(), "marker_id", m.ID, "err", err)
+			labels = nil
+		}
 		created, _, err := s.client.Issues.Create(ctx, dest.Owner, dest.Name, gh.CreateIssueRequest{
-			Title: src.Title,
-			Body:  gh.Ptr(body),
+			Title:  src.Title,
+			Body:   gh.Ptr(body),
+			Labels: labels,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("create issue: %w", err)
@@ -70,7 +79,10 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 
 	existingNum := int64(existing.GetNumber())
 	stateChange := sink.PropagateState(existing.GetState(), src.State)
-	if existing.GetBody() == body && existing.GetTitle() == src.Title && stateChange == nil {
+	current := labelNames(existing.Labels)
+	wantLabels := sink.ShadowLabels(current, sink.SyncedLabels(existing.GetBody()), src.Labels)
+	labelsChanged := !sink.LabelsEqual(current, wantLabels)
+	if existing.GetBody() == body && existing.GetTitle() == src.Title && stateChange == nil && !labelsChanged {
 		s.log.Debug("github sink: issue unchanged, skip",
 			"dest", dest.Slug(), "dest_num", existingNum)
 		return existingNum, nil
@@ -93,6 +105,17 @@ func (s *Sink) UpsertIssue(ctx context.Context, dest source.Repo, src source.Iss
 	}
 	if stateChange != nil {
 		editReq.State = stateChange
+	}
+	// A non-nil Labels replaces the set, so an empty slice clears it.
+	if labelsChanged {
+		labels, err := s.ensureLabels(ctx, dest, wantLabels)
+		if err != nil {
+			// Logged, not returned: a label problem shouldn't block the issue's comments.
+			s.log.Warn("github sink: label sync failed",
+				"dest", dest.Slug(), "dest_num", existingNum, "err", err)
+		} else {
+			editReq.Labels = labels
+		}
 	}
 	if _, _, err := s.client.Issues.Update(ctx, dest.Owner, dest.Name, existing.GetNumber(), *editReq); err != nil {
 		return 0, fmt.Errorf("edit issue: %w", err)
@@ -173,6 +196,56 @@ func (s *Sink) CommentAndClosePullRequest(ctx context.Context, dest source.Repo,
 	return nil
 }
 
+// ensureLabels makes sure every name exists as a label on dest, creating the
+// missing ones, and returns the names as dest spells them. Names match
+// case-insensitively, as GitHub does.
+func (s *Sink) ensureLabels(ctx context.Context, dest source.Repo, names []string) ([]string, error) {
+	out := make([]string, 0, len(names))
+	if len(names) == 0 {
+		return out, nil
+	}
+	byName := map[string]string{}
+	listOpts := &gh.ListOptions{PerPage: 100}
+	for page := 1; ; page++ {
+		listOpts.Page = page
+		batch, _, err := s.client.Issues.ListLabels(ctx, dest.Owner, dest.Name, listOpts)
+		if err != nil {
+			return nil, fmt.Errorf("list labels: %w", err)
+		}
+		for _, l := range batch {
+			byName[strings.ToLower(l.GetName())] = l.GetName()
+		}
+		if len(batch) < 100 {
+			break
+		}
+	}
+	for _, name := range names {
+		if existing, ok := byName[strings.ToLower(name)]; ok {
+			out = append(out, existing)
+			continue
+		}
+		color := sink.LabelColor
+		if _, _, err := s.client.Issues.CreateLabel(ctx, dest.Owner, dest.Name, gh.CreateIssueLabelRequest{
+			Name:  name,
+			Color: &color,
+		}); err != nil {
+			return nil, fmt.Errorf("create label %q: %w", name, err)
+		}
+		s.log.Info("github sink: created label", "dest", dest.Slug(), "label", name)
+		byName[strings.ToLower(name)] = name
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+func labelNames(labels []*gh.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, l.GetName())
+	}
+	return names
+}
+
 func (s *Sink) findByMarker(ctx context.Context, dest source.Repo, m marker.Marker) (*gh.Issue, error) {
 	q := fmt.Sprintf("%s repo:%s/%s", m.SearchToken(), dest.Owner, dest.Name)
 	searchOpts := &gh.SearchOptions{ListOptions: gh.ListOptions{PerPage: 50}}
@@ -249,7 +322,8 @@ func (s *Sink) findCommentByMarker(ctx context.Context, dest source.Repo, issueN
 }
 
 func renderIssueBody(src source.Issue, m marker.Marker) string {
-	return sink.RenderBody(src.Author, src.HTMLURL, src.CreatedAt, src.Body, m, bodyLimit)
+	body := sink.RenderBody(src.Author, src.HTMLURL, src.CreatedAt, src.Body, m, bodyLimit)
+	return sink.WithSyncedLabels(body, src.Labels)
 }
 
 func renderCommentBody(src source.Comment, m marker.Marker) string {
