@@ -44,6 +44,7 @@ const (
 	syncCommand         = "/sync"
 	prTitlePrefix       = "[PR #"
 	stateOpen           = "open"
+	localOnlyLabel      = "local-only"
 )
 
 // forgejoClient is the canonical Forgejo SDK surface the engine drives.
@@ -458,7 +459,38 @@ func (e *Engine) syncOutbound(ctx context.Context, canonical source.Repo, host s
 	if err != nil {
 		return err
 	}
-	return e.syncOneWay(ctx, e.canonicalSrc, canonical, dst, target, since)
+	return e.syncOneWay(ctx, localOnlyFilter{e.canonicalSrc}, canonical, dst, target, since)
+}
+
+// localOnlyFilter hides native canonical issues labelled local-only from Flow
+// B, so they never leave the canonical Forgejo. Shadows are kept: they already
+// exist on the target, and replies to them should still flow back.
+type localOnlyFilter struct {
+	source.Provider
+}
+
+func (f localOnlyFilter) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
+	issues, err := f.Provider.ListIssues(ctx, repo, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]source.Issue, 0, len(issues))
+	for _, iss := range issues {
+		if !marker.Has(iss.Body) && hasLabel(iss.Labels, localOnlyLabel) {
+			continue
+		}
+		out = append(out, iss)
+	}
+	return out, nil
+}
+
+func hasLabel(labels []string, name string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // syncOneWay applies the shared per-direction logic: list issues from `src`,

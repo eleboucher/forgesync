@@ -98,3 +98,7 @@ Comment `/sync` on a `[PR #N]` shadow issue in your canonical Forgejo to promote
 Forgejo's push-mirror uses `git push --mirror`, which deletes refs on the remote that don't exist locally. If you opened a PR on the GitHub mirror from a branch that was never pushed through your canonical Forgejo, that branch only lives on GitHub. Creating `forgesync/pr-N` on Forgejo triggers push-mirror, which deletes the branch and GitHub closes the PR.
 
 Fork PRs are not affected — the head branch lives in the contributor's fork, which push-mirror doesn't touch.
+
+## Keeping an issue on Forgejo
+
+Label an issue `local-only` (any case) in your canonical Forgejo and forgesync won't copy it, or its comments, to any mirror. Add the label before the next tick: an issue that has already been copied keeps its mirror copy, which simply stops receiving updates. Imported issues are unaffected, so replies to them still flow back to the mirror.

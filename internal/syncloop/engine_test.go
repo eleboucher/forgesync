@@ -212,6 +212,43 @@ func TestSyncRepo_SkipsReposWithoutAdmin(t *testing.T) {
 	}
 }
 
+func TestLocalOnlyFilter_KeepsLabelledNativeIssuesOnCanonical(t *testing.T) {
+	// A shadow labelled local-only still routes its comments: the label only
+	// keeps a canonical-native issue from being published.
+	dstRepo := srcRepo()
+	shadowMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: dstRepo.Slug(), Kind: kindIssue, ID: 99}
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 1, Body: "public", UpdatedAt: time.Now()},
+			{Number: 2, Body: "private", Labels: []string{"bug", localOnlyLabel}, UpdatedAt: time.Now()},
+			{Number: 3, Body: "private too", Labels: []string{"Local-Only"}, UpdatedAt: time.Now()},
+			{Number: 4, Body: "imported\n\n" + shadowMarker.String(), Labels: []string{localOnlyLabel}, UpdatedAt: time.Now()},
+		},
+		comments: map[int64][]source.Comment{
+			2: {{ID: 20, Body: "stays here", UpdatedAt: time.Now()}},
+			4: {{ID: 40, Body: "reply to the shadow", UpdatedAt: time.Now()}},
+		},
+	}
+	sink := &fakeSink{kind: tGithub}
+	e := newEngine()
+
+	if err := e.syncOneWay(context.Background(), localOnlyFilter{src},
+		forkRepo(), sink, dstRepo, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(sink.issueMarkers) != 1 || sink.issueMarkers[0].ID != 1 {
+		t.Errorf("expected only issue 1 to be published, got %+v", sink.issueMarkers)
+	}
+	if len(sink.commentMarkers) != 1 || sink.commentMarkers[0].ID != 40 {
+		t.Errorf("expected only the shadow's comment to flow, got %+v", sink.commentMarkers)
+	}
+	if len(src.issues) != 4 {
+		t.Errorf("filter must not modify the provider's slice, got %d issues", len(src.issues))
+	}
+}
+
 func TestSyncOneWay_MarkersCarrySourceIdentity(t *testing.T) {
 	src := &fakeSource{
 		kind: tForgejo, host: tFJHost,
