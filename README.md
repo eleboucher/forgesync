@@ -99,6 +99,12 @@ Forgejo's push-mirror uses `git push --mirror`, which deletes refs on the remote
 
 Fork PRs are not affected — the head branch lives in the contributor's fork, which push-mirror doesn't touch.
 
+## Your pull requests to upstream
+
+If a GitHub mirror target is itself a fork, forgesync also copies the pull requests the fork's owner opened on the parent repo into your canonical Forgejo, as `[upstream PR #N]` issues. They carry the PR's comments and follow its open/closed state, so you can track upstream reviews from Forgejo.
+
+These are read-only. Comments you add to them stay on Forgejo; reply on GitHub to reach the upstream maintainers. Line-level review comments are not copied, only the PR's conversation.
+
 ## Keeping an issue on Forgejo
 
 Label an issue `local-only` (any case) in your canonical Forgejo and forgesync won't copy it, or its comments, to any mirror. Add the label before the next tick: an issue that has already been copied keeps its mirror copy, which simply stops receiving updates. Imported issues are unaffected, so replies to them still flow back to the mirror.

@@ -23,6 +23,7 @@ const (
 	tRepoFork = "fork"
 	tRepoSrc  = "src"
 	tOwner    = "me"
+	tUpstream = "up/parent"
 )
 
 func forkRepo() source.Repo { return source.Repo{Owner: tOwner, Name: tRepoFork} }
@@ -330,6 +331,105 @@ func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
 	}
 	if time.Since(e.lastSynced[key]) > time.Second {
 		t.Errorf("a successful run must become the resume point")
+	}
+}
+
+// fakeUpstream implements upstreamSource.
+type fakeUpstream struct {
+	parent      source.Repo
+	isFork      bool
+	prs         *fakeSource
+	author      string
+	parentCalls int
+}
+
+func (f *fakeUpstream) Parent(context.Context, source.Repo) (source.Repo, bool, error) {
+	f.parentCalls++
+	return f.parent, f.isFork, nil
+}
+
+func (f *fakeUpstream) UpstreamPullRequests(author string) source.Provider {
+	f.author = author
+	return f.prs
+}
+
+func TestSyncUpstreamPRs(t *testing.T) {
+	canonical := srcRepo()
+	target := forkRepo()
+	parent := source.Repo{Owner: "up", Name: "parent"}
+
+	cases := []struct {
+		name        string
+		host        string
+		isFork      bool
+		mirrored    map[string]bool
+		wantUpserts int
+	}{
+		{"fork on github", githubHost, true, nil, 1},
+		{"not a fork", githubHost, false, nil, 0},
+		{"non-github host skipped", tFJHost, true, nil, 0},
+		// Flow A already imports the parent's PRs; don't fight it over shadows.
+		{"parent is also a mirror", githubHost, true, map[string]bool{"github.com/up/parent": true}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeUpstream{
+				parent: parent, isFork: tc.isFork,
+				prs: &fakeSource{kind: tGithub, host: tGHHost, issues: []source.Issue{
+					{Number: 4, Title: "[upstream PR #4] add postgres", State: stateOpen, UpdatedAt: time.Now()},
+				}},
+			}
+			cs := &fakeCanonicalSink{}
+			e := newEngine()
+			e.cfg = &config.Config{
+				PollInterval: 5 * time.Minute, InitialBackfill: time.Hour,
+				Targets: config.Targets{GitHub: config.GitHubTarget{Token: "t"}},
+			}
+			e.upstream = up
+			e.canonicalSink = cs
+
+			if err := e.syncUpstreamPRs(context.Background(), canonical, tc.host, target, time.Now(), tc.mirrored); err != nil {
+				t.Fatal(err)
+			}
+			if len(cs.issueMarkers) != tc.wantUpserts {
+				t.Fatalf("upserts = %d, want %d", len(cs.issueMarkers), tc.wantUpserts)
+			}
+			if tc.wantUpserts == 0 {
+				return
+			}
+			if up.author != tOwner {
+				t.Errorf("PRs read for author %q, want the fork owner %q", up.author, tOwner)
+			}
+			want := marker.Marker{Type: tGithub, Host: tGHHost, Repo: parent.Slug(), Kind: kindIssue, ID: 4}
+			if cs.issueMarkers[0] != want {
+				t.Errorf("marker: got %+v want %+v", cs.issueMarkers[0], want)
+			}
+		})
+	}
+}
+
+func TestUpstreamPRShadow_NeverFlowsOut(t *testing.T) {
+	// The shadow and a reply to it sit in canonical. Flow B to the fork must
+	// treat the shadow as foreign: nothing reaches the fork, or the parent.
+	shadow := marker.Marker{Type: tGithub, Host: tGHHost, Repo: tUpstream, Kind: kindIssue, ID: 4}
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 9, Title: "[upstream PR #4] add postgres", Body: "x\n\n" + shadow.String(), UpdatedAt: time.Now()},
+		},
+		comments: map[int64][]source.Comment{
+			9: {{ID: 90, Body: "note to self", UpdatedAt: time.Now()}},
+		},
+	}
+	sink := &fakeSink{kind: tGithub}
+	e := newEngine()
+	if err := e.syncOneWay(context.Background(), localOnlyFilter{src},
+		srcRepo(), sink, forkRepo(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.issueMarkers) != 0 || len(sink.commentMarkers) != 0 {
+		t.Errorf("expected nothing written out, got issues=%d comments=%d",
+			len(sink.issueMarkers), len(sink.commentMarkers))
 	}
 }
 

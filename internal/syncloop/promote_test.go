@@ -57,14 +57,18 @@ func (f *fakeFJClient) EditIssue(_, _ string, _ int64, opt gitea.EditIssueOption
 
 // fakeCanonicalSink implements canonicalPRSink.
 type fakeCanonicalSink struct {
-	hasShadow   bool
-	upsertNum   int64
-	upsertCalls int
+	hasShadow    bool
+	upsertNum    int64
+	upsertCalls  int
+	issueMarkers []marker.Marker
+	issueTitles  []string
 }
 
 func (f *fakeCanonicalSink) Kind() string { return "forgejo" }
 
-func (f *fakeCanonicalSink) UpsertIssue(context.Context, source.Repo, source.Issue, marker.Marker) (int64, error) {
+func (f *fakeCanonicalSink) UpsertIssue(_ context.Context, _ source.Repo, iss source.Issue, m marker.Marker) (int64, error) {
+	f.issueMarkers = append(f.issueMarkers, m)
+	f.issueTitles = append(f.issueTitles, iss.Title)
 	return 0, nil
 }
 

@@ -5,6 +5,8 @@
 //	        mirror flow back into the source-of-truth)
 //	Flow B: canonical → each push_mirror target (issues/comments filed in
 //	        the canonical Forgejo flow out to the mirror)
+//	Upstream: when a GitHub target is a fork, the PRs its owner opened on the
+//	        parent repo → canonical (read-only; nothing is written upstream)
 //
 // Loop prevention: items whose body contains a forgesync marker are shadows
 // (forgesync wrote them); they are filtered out at read time on every side.
@@ -63,6 +65,13 @@ type pullRequestSource interface {
 	GetPullRequest(ctx context.Context, repo source.Repo, number int64) (source.PullRequest, error)
 }
 
+// upstreamSource finds the repo a GitHub mirror was forked from, and reads the
+// pull requests the fork's owner opened there (GitHub today).
+type upstreamSource interface {
+	Parent(ctx context.Context, repo source.Repo) (source.Repo, bool, error)
+	UpstreamPullRequests(author string) source.Provider
+}
+
 // canonicalPRSink is the canonical sink as used by the promotion path: a
 // sink.Sink that can also create real Forgejo PRs and report existing shadows.
 type canonicalPRSink interface {
@@ -86,6 +95,7 @@ type Engine struct {
 	cfg      *config.Config
 	fjClient forgejoClient     // canonical Forgejo SDK ops
 	ghPRs    pullRequestSource // fetches GitHub PRs to promote
+	upstream upstreamSource    // reads the fork owner's PRs on the parent repo
 	log      *slog.Logger
 
 	// Canonical Forgejo as both source (for Flow B reads) and sink (for Flow A writes).
@@ -123,6 +133,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
 		cfg:           cfg,
 		fjClient:      srcClient,
 		ghPRs:         githubSrc,
+		upstream:      githubSrc,
 		log:           log,
 		canonicalSrc:  fjsource.NewWithClient(srcClient, canonicalHost),
 		canonicalSink: fjsink.New(srcClient, cfg.Bot.Username, log),
@@ -232,6 +243,12 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 	}
 
 	canonical := source.Repo{Owner: owner, Name: name}
+	mirrored := map[string]bool{}
+	for _, m := range mirrors {
+		if host, target, err := parseRemoteRepo(m.RemoteAddress); err == nil {
+			mirrored[strings.ToLower(host+"/"+target.Slug())] = true
+		}
+	}
 	for _, m := range mirrors {
 		host, target, err := parseRemoteRepo(m.RemoteAddress)
 		if err != nil {
@@ -256,8 +273,44 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 		if err := e.detectAndPromotePRs(ctx, canonical, host, target); err != nil {
 			e.log.Error("PR promotion pass failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
+		// Upstream flow: the fork owner's PRs on the parent repo → canonical.
+		if err := e.syncUpstreamPRs(ctx, canonical, host, target, since, mirrored); err != nil {
+			e.log.Error("upstream PR sync failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
+		}
 	}
 	return nil
+}
+
+// syncUpstreamPRs mirrors the pull requests the fork's owner opened on the
+// repo a GitHub mirror was forked from into canonical as "[upstream PR #N]"
+// issues, with their comments and open/closed state. It is read-only: the
+// shadows' markers point at the parent, which is not a mirror target, so Flow
+// B treats them as foreign and nothing is written upstream.
+//
+// mirrored holds this repo's mirror targets as lower-cased "host/owner/name".
+// When the parent is one of them, Flow A already imports its PRs, and the two
+// flows would fight over the same shadows, so this one stands down.
+func (e *Engine) syncUpstreamPRs(ctx context.Context, canonical source.Repo, host string, target source.Repo, since time.Time, mirrored map[string]bool) error {
+	if host != githubHost || e.cfg.Targets.GitHub.Token == "" {
+		return nil
+	}
+	parent, ok, err := e.upstream.Parent(ctx, target)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	upstream := host + "/" + parent.Slug()
+	if mirrored[strings.ToLower(upstream)] {
+		e.log.Debug("skip upstream PRs: parent is also a mirror target",
+			"repo", canonical.Slug(), "parent", parent.Slug())
+		return nil
+	}
+	src := e.upstream.UpstreamPullRequests(target.Owner)
+	return e.runFlow(canonical.Slug()+"<-"+upstream+"@"+target.Owner, since, func(since time.Time) error {
+		return e.syncOneWay(ctx, src, parent, e.canonicalSink, canonical, since)
+	})
 }
 
 // runFlow runs one flow with its look-back widened by flowSince, and makes the

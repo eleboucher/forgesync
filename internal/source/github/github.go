@@ -62,6 +62,73 @@ func (p *Provider) ListPullRequests(_ context.Context, _ source.Repo, _ source.L
 	return nil, nil
 }
 
+// Parent returns the repo that repo was forked from, and false if it isn't a
+// fork.
+func (p *Provider) Parent(ctx context.Context, repo source.Repo) (source.Repo, bool, error) {
+	r, _, err := p.client.Repositories.Get(ctx, repo.Owner, repo.Name)
+	if err != nil {
+		return source.Repo{}, false, fmt.Errorf("get repo: %w", err)
+	}
+	parent := r.GetParent()
+	if parent == nil {
+		return source.Repo{}, false, nil
+	}
+	return source.Repo{Owner: parent.GetOwner().GetLogin(), Name: parent.GetName()}, true, nil
+}
+
+// UpstreamPullRequests returns a read-only view of the pull requests author
+// opened on another repo, typically the parent of their fork. Its ListIssues
+// yields only those PRs, titled "[upstream PR #N]"; ListComments is their
+// conversation.
+func (p *Provider) UpstreamPullRequests(author string) source.Provider {
+	return &upstreamPRs{Provider: p, author: author}
+}
+
+type upstreamPRs struct {
+	*Provider
+	author string
+}
+
+func (u *upstreamPRs) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
+	out := []source.Issue{}
+	listOpts := &gh.IssueListByRepoOptions{
+		State:       "all",
+		Creator:     u.author,
+		ListOptions: gh.ListOptions{PerPage: pageSize},
+	}
+	if !opts.Since.IsZero() {
+		listOpts.Since = opts.Since
+	}
+	for page := 1; ; page++ {
+		listOpts.ListOptions.Page = page //nolint:staticcheck // ListCursorOptions also has Page; explicit selector avoids ambiguity
+		batch, _, err := u.client.Issues.ListByRepo(ctx, repo.Owner, repo.Name, listOpts)
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, i := range batch {
+			if i.PullRequestLinks == nil {
+				continue
+			}
+			out = append(out, mapUpstreamPR(i))
+		}
+		if len(batch) < pageSize {
+			break
+		}
+	}
+	return out, nil
+}
+
+// mapUpstreamPR maps like mapIssue but with its own title prefix, so the
+// shadow is never mistaken for a "[PR #N]" shadow that /sync can promote.
+func mapUpstreamPR(i *gh.Issue) source.Issue {
+	iss := mapIssue(i)
+	iss.Title = fmt.Sprintf("[upstream PR #%d] %s", i.GetNumber(), i.GetTitle())
+	return iss
+}
+
 // GetPullRequest fetches a single PR and maps it to source.PullRequest,
 // including the head ref/SHA and merge state needed to promote it into Forgejo.
 func (p *Provider) GetPullRequest(ctx context.Context, repo source.Repo, number int64) (source.PullRequest, error) {
