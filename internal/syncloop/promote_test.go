@@ -22,9 +22,10 @@ type recorder struct{ events []string }
 
 // fakeFJClient implements forgejoClient.
 type fakeFJClient struct {
-	rec        *recorder
-	openIssues []*gitea.Issue
-	comments   []gitea.CreateIssueCommentOption
+	rec             *recorder
+	openIssues      []*gitea.Issue
+	comments        []gitea.CreateIssueCommentOption
+	pushMirrorCalls int
 }
 
 func (f *fakeFJClient) SetContext(context.Context) {}
@@ -34,6 +35,7 @@ func (f *fakeFJClient) SearchRepos(gitea.SearchRepoOptions) ([]*gitea.Repository
 }
 
 func (f *fakeFJClient) ListPushMirrors(string, string, gitea.ListOptions) ([]*gitea.PushMirrorResponse, *gitea.Response, error) {
+	f.pushMirrorCalls++
 	return nil, nil, nil
 }
 

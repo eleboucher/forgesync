@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"code.gitea.io/sdk/gitea"
+
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
@@ -180,6 +182,33 @@ func TestSyncOneWay_FiltersShadowComments(t *testing.T) {
 	}
 	if sink.commentMarkers[0].ID != 10 {
 		t.Errorf("expected comment id=10, got %d", sink.commentMarkers[0].ID)
+	}
+}
+
+func TestSyncRepo_SkipsReposWithoutAdmin(t *testing.T) {
+	cases := []struct {
+		name      string
+		perms     *gitea.Permission
+		wantCalls int
+	}{
+		{"no permissions reported", nil, 1},
+		{"read only", &gitea.Permission{Pull: true}, 0},
+		{"push without admin", &gitea.Permission{Pull: true, Push: true}, 0},
+		{"admin", &gitea.Permission{Pull: true, Push: true, Admin: true}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fj := &fakeFJClient{}
+			e := newEngine()
+			e.fjClient = fj
+			repo := &gitea.Repository{FullName: tOwner + "/" + tRepoSrc, Permissions: tc.perms}
+			if err := e.syncRepo(context.Background(), repo, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if fj.pushMirrorCalls != tc.wantCalls {
+				t.Errorf("ListPushMirrors calls = %d, want %d", fj.pushMirrorCalls, tc.wantCalls)
+			}
+		})
 	}
 }
 

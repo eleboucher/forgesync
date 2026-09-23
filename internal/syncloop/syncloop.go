@@ -210,6 +210,13 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 		e.log.Warn("skip repo: unexpected full name", "full_name", repo.FullName)
 		return nil
 	}
+	// Listing push mirrors needs repo admin, but the search returns every repo
+	// the token can read. Skip the rest here instead of failing on each tick.
+	// A server that doesn't report permissions gets the old behaviour.
+	if repo.Permissions != nil && !repo.Permissions.Admin {
+		e.log.Debug("skip repo: token is not a repo admin", "repo", repo.FullName)
+		return nil
+	}
 	mirrors, _, err := e.fjClient.ListPushMirrors(owner, name, gitea.ListOptions{})
 	if err != nil {
 		return err

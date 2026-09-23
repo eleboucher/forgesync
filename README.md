@@ -84,7 +84,7 @@ The image is distroless, runs as non-root, and exposes `:8080` for `/healthz`. T
 No setup beyond the source token. Each tick:
 
 1. enumerate repos via `GET /repos/search` on your Forgejo,
-2. for each repo, `GET /repos/{owner}/{repo}/push_mirrors`,
+2. for each repo the token is an admin of, `GET /repos/{owner}/{repo}/push_mirrors` (listing push mirrors needs admin, so other repos are skipped),
 3. classify each mirror's `remote_address` (github.com, or a host listed under `targets.forgejo`),
 4. pull issues + comments from the target since `now - 2*pollInterval`,
 5. for each item, search the destination for the marker -- create if missing, PATCH if changed, skip if equal.
