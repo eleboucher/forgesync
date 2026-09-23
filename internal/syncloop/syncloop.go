@@ -365,7 +365,9 @@ func (e *Engine) detectAndPromotePRs(ctx context.Context, canonical source.Repo,
 			continue
 		}
 		m, ok := marker.Parse(iss.Body)
-		if !ok || m.Host != githubHost || m.Kind != kindIssue {
+		// The shadow must come from this mirror: with several GitHub mirrors,
+		// another mirror's PR #N would otherwise be fetched and closed here.
+		if !ok || m.Host != githubHost || m.Kind != kindIssue || m.Repo != target.Slug() {
 			continue
 		}
 

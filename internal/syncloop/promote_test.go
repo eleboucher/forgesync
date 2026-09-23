@@ -133,12 +133,15 @@ func testEngine(fj *fakeFJClient, cs *fakeCanonicalSink, ghSink *fakeGHSink, prS
 	}
 }
 
-const tBot = "forgesync-bot"
+const (
+	tBot     = "forgesync-bot"
+	tPRTitle = "[PR #7] thing"
+)
 
 func TestPromotePR_CloseOrdering(t *testing.T) {
 	canonical := source.Repo{Owner: tOwner, Name: tRepoSrc}
 	target := source.Repo{Owner: tOwner, Name: tRepoSrc}
-	iss := source.Issue{Number: 14, Title: "[PR #7] thing"}
+	iss := source.Issue{Number: 14, Title: tPRTitle}
 	issMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindIssue, ID: 7}
 	prMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindPullRequest, ID: 7}
 
@@ -195,7 +198,7 @@ func TestDetectAndPromotePRs(t *testing.T) {
 	prShadowMarker := marker.Marker{Type: tGithub, Host: tGHHost, Repo: target.Slug(), Kind: kindIssue, ID: 7}
 
 	prShadowIssue := func() *gitea.Issue {
-		return &gitea.Issue{Index: 14, Title: "[PR #7] thing", Body: "body\n\n" + prShadowMarker.String()}
+		return &gitea.Issue{Index: 14, Title: tPRTitle, Body: "body\n\n" + prShadowMarker.String()}
 	}
 	syncComment := map[int64][]source.Comment{
 		14: {{Author: source.User{Login: "alice"}, Body: syncCommand}},
@@ -217,6 +220,11 @@ func TestDetectAndPromotePRs(t *testing.T) {
 		{"already promoted retries close", githubHost, []*gitea.Issue{prShadowIssue()}, syncComment, true, false, 1},
 		{"non-github host skipped", tFJHost, []*gitea.Issue{prShadowIssue()}, syncComment, false, false, 0},
 		{"non-PR issue ignored", githubHost, []*gitea.Issue{{Index: 1, Title: "regular bug"}}, nil, false, false, 0},
+		// A PR shadow from a different GitHub mirror of the same repo.
+		{"other mirror's PR ignored", githubHost, []*gitea.Issue{{
+			Index: 14, Title: tPRTitle,
+			Body: "body\n\n" + marker.Marker{Type: tGithub, Host: tGHHost, Repo: "someone/else", Kind: kindIssue, ID: 7}.String(),
+		}}, syncComment, false, false, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
