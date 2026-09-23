@@ -45,7 +45,7 @@ cp configs/forgesync.example.yaml configs/forgesync.yaml
 | `FORGESYNC_GITHUB_TOKEN`         | --      | only if any push mirror points at github.com |
 | `FORGESYNC_FORGEJO_TOKEN_<HOST>` | --      | one per non-github mirror host (see below)   |
 | `FORGESYNC_POLL_INTERVAL`        | `5m`    | no                                           |
-| `FORGESYNC_INITIAL_BACKFILL`     | `1h`    | no (look-back on the first tick)             |
+| `FORGESYNC_INITIAL_BACKFILL`     | `1h`    | no (look-back on the first tick, and the furthest a failing flow catches up) |
 | `FORGESYNC_TICK_TIMEOUT`         | `0`     | no (`0` = no per-tick deadline)              |
 | `FORGESYNC_HEALTH_LISTEN`        | `:8080` | no                                           |
 | `FORGESYNC_LOG_FORMAT`           | `text`  | no (`text` or `json`)                        |
@@ -86,7 +86,7 @@ No setup beyond the source token. Each tick:
 1. enumerate repos via `GET /repos/search` on your Forgejo,
 2. for each repo the token is an admin of, `GET /repos/{owner}/{repo}/push_mirrors` (listing push mirrors needs admin, so other repos are skipped),
 3. classify each mirror's `remote_address` (github.com, or a host listed under `targets.forgejo`),
-4. pull issues + comments from the target since `now - 2*pollInterval`,
+4. pull issues + comments from the target since `now - 2*pollInterval`, or since the last successful run of that repo/mirror/direction if failures have held it back (at most `initialBackfill`),
 5. for each item, search the destination for the marker -- create if missing, PATCH if changed, skip if equal.
 
 ## Promoting a GitHub PR with `/sync`

@@ -99,6 +99,11 @@ type Engine struct {
 	// Inbound (Flow A) sources per host, lazily populated.
 	githubSrc   *ghsource.Provider
 	forgejoSrcs map[string]*fjsource.Provider
+
+	// Resume points per flow: the start of its last successful run. In memory
+	// only; after a restart the first tick's InitialBackfill covers the gap.
+	initialSince time.Time
+	lastSynced   map[string]time.Time
 }
 
 func New(cfg *config.Config, log *slog.Logger) (*Engine, error) {
@@ -134,8 +139,8 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// First tick uses the wider InitialBackfill window so we catch activity
 	// from before the daemon started.
-	initialSince := time.Now().Add(-e.cfg.InitialBackfill)
-	if err := e.tick(ctx, initialSince); err != nil && !errors.Is(err, context.Canceled) {
+	e.initialSince = time.Now().Add(-e.cfg.InitialBackfill)
+	if err := e.tick(ctx, e.initialSince); err != nil && !errors.Is(err, context.Canceled) {
 		e.log.Error("initial tick failed", "err", err)
 	}
 
@@ -234,12 +239,17 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 			continue
 		}
 
+		mirror := host + "/" + target.Slug()
 		// Flow A: target → canonical
-		if err := e.syncInbound(ctx, canonical, host, target, since); err != nil {
+		if err := e.runFlow(canonical.Slug()+"<-"+mirror, since, func(since time.Time) error {
+			return e.syncInbound(ctx, canonical, host, target, since)
+		}); err != nil {
 			e.log.Error("flow A failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// Flow B: canonical → target
-		if err := e.syncOutbound(ctx, canonical, host, target, since); err != nil {
+		if err := e.runFlow(canonical.Slug()+"->"+mirror, since, func(since time.Time) error {
+			return e.syncOutbound(ctx, canonical, host, target, since)
+		}); err != nil {
 			e.log.Error("flow B failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// /sync command flow: promote PR-shadow issues to real Forgejo PRs.
@@ -248,6 +258,40 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 		}
 	}
 	return nil
+}
+
+// runFlow runs one flow with its look-back widened by flowSince, and makes the
+// run the flow's new resume point only if it succeeded.
+func (e *Engine) runFlow(key string, since time.Time, run func(since time.Time) error) error {
+	start := time.Now()
+	if err := run(e.flowSince(key, since)); err != nil {
+		return err
+	}
+	if e.lastSynced == nil {
+		e.lastSynced = map[string]time.Time{}
+	}
+	e.lastSynced[key] = start
+	return nil
+}
+
+// flowSince widens since back to the flow's last successful run, so a flow
+// that kept failing (a forge outage, a revoked token) catches up once it
+// recovers instead of skipping everything that changed meanwhile. A flow that
+// has never succeeded resumes from the first tick's look-back. The widening
+// stops at InitialBackfill, the same bound a restart gets.
+func (e *Engine) flowSince(key string, since time.Time) time.Time {
+	resume := e.initialSince
+	if last, ok := e.lastSynced[key]; ok {
+		// One poll interval of overlap, as Window() allows for a normal tick.
+		resume = last.Add(-e.cfg.PollInterval)
+	}
+	if floor := time.Now().Add(-e.cfg.InitialBackfill); resume.Before(floor) {
+		resume = floor
+	}
+	if resume.Before(since) {
+		return resume
+	}
+	return since
 }
 
 // detectAndPromotePRs looks for [PR #N] shadow issues with a /sync comment and
@@ -513,8 +557,14 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 		"direction", src.Kind()+"→"+dst.Kind(),
 		"src_repo", srcRepo.Slug(), "count", len(issues))
 
+	// Item failures are logged as they happen and counted, so the flow reports
+	// failure and runFlow keeps its resume point for the next tick to retry.
+	var failed int
 	for _, iss := range issues {
-		destNum, ok := e.routeIssue(ctx, src, srcRepo, dst, dstRepo, iss)
+		destNum, ok, err := e.routeIssue(ctx, src, srcRepo, dst, dstRepo, iss)
+		if err != nil {
+			failed++
+		}
 		if !ok {
 			continue
 		}
@@ -523,6 +573,7 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 		if err != nil {
 			e.log.Error("list comments failed",
 				"src_repo", srcRepo.Slug(), "src_num", iss.Number, "err", err)
+			failed++
 			continue
 		}
 		var (
@@ -546,6 +597,7 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 				e.log.Error("upsert comment failed",
 					"dst_repo", dstRepo.Slug(), "dst_issue", destNum,
 					"src_comment", c.ID, "err", err)
+				failed++
 			}
 		}
 		if len(comments) > 0 {
@@ -555,29 +607,32 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 				"total", len(comments), "native", nativeComments, "shadows", shadowFiltered)
 		}
 	}
+	if failed > 0 {
+		return fmt.Errorf("%d item(s) failed to sync", failed)
+	}
 	return nil
 }
 
 // routeIssue decides what destination issue number to use for an item read
 // from src. It returns (destNum, true) when comments under this issue should
-// be processed.
+// be processed, and an error only when the upsert failed.
 //
 //   - Native issue (no marker): upsert to dst, return the new dest number.
 //   - Shadow whose marker points at the current dst: don't upsert (loop), but
 //     return the marker's ID so native comments can be parented correctly.
 //   - Shadow pointing somewhere else: skip — not our concern in this direction.
-func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo source.Repo, dst sink.Sink, dstRepo source.Repo, iss source.Issue) (int64, bool) {
+func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo source.Repo, dst sink.Sink, dstRepo source.Repo, iss source.Issue) (int64, bool, error) {
 	if m, isShadow := marker.Parse(iss.Body); isShadow {
 		if m.Type != dst.Kind() || m.Repo != dstRepo.Slug() || m.Kind != kindIssue {
 			e.log.Debug("foreign shadow skipped",
 				"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 				"marker_type", m.Type, "marker_repo", m.Repo)
-			return 0, false
+			return 0, false, nil
 		}
 		e.log.Debug("shadow routed for comment-only sync",
 			"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 			"dst_repo", dstRepo.Slug(), "dst_num", m.ID)
-		return m.ID, true
+		return m.ID, true, nil
 	}
 	issueMarker := marker.Marker{
 		Type: src.Kind(),
@@ -591,9 +646,9 @@ func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo so
 		e.log.Error("upsert issue failed",
 			"src_repo", srcRepo.Slug(), "src_num", iss.Number,
 			"dst_repo", dstRepo.Slug(), "err", err)
-		return 0, false
+		return 0, false, err
 	}
-	return destNum, true
+	return destNum, true, nil
 }
 
 func (e *Engine) sourceForHost(host string) (source.Provider, error) {

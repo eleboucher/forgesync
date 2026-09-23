@@ -2,6 +2,7 @@ package syncloop
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"code.gitea.io/sdk/gitea"
 
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/config"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
@@ -53,10 +55,14 @@ type fakeSink struct {
 	issueMarkers    []marker.Marker
 	commentMarkers  []marker.Marker
 	commentDestNums []int64
+	failIssue       int64 // UpsertIssue fails for this source id
 }
 
 func (f *fakeSink) Kind() string { return f.kind }
 func (f *fakeSink) UpsertIssue(_ context.Context, _ source.Repo, _ source.Issue, m marker.Marker) (int64, error) {
+	if f.failIssue != 0 && m.ID == f.failIssue {
+		return 0, errors.New("upsert failed")
+	}
 	f.issueMarkers = append(f.issueMarkers, m)
 	return m.ID, nil // mirror the source id
 }
@@ -246,6 +252,84 @@ func TestLocalOnlyFilter_KeepsLabelledNativeIssuesOnCanonical(t *testing.T) {
 	}
 	if len(src.issues) != 4 {
 		t.Errorf("filter must not modify the provider's slice, got %d issues", len(src.issues))
+	}
+}
+
+func TestSyncOneWay_ItemFailureFailsTheFlow(t *testing.T) {
+	// One issue fails: the rest still sync, but the flow reports failure so its
+	// resume point stays put and the next tick retries.
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 1, Body: "ok", UpdatedAt: time.Now()},
+			{Number: 2, Body: "fails", UpdatedAt: time.Now()},
+			{Number: 3, Body: "ok too", UpdatedAt: time.Now()},
+		},
+	}
+	sink := &fakeSink{kind: tGithub, failIssue: 2}
+	e := newEngine()
+	err := e.syncOneWay(context.Background(), src, forkRepo(), sink, srcRepo(), time.Now())
+	if err == nil {
+		t.Fatal("expected the flow to report the failed item")
+	}
+	if len(sink.issueMarkers) != 2 {
+		t.Errorf("expected the other 2 issues to sync, got %d", len(sink.issueMarkers))
+	}
+}
+
+func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
+	const key = "me/src<-github.com/me/fork"
+	e := newEngine()
+	e.cfg = &config.Config{PollInterval: 5 * time.Minute, InitialBackfill: 24 * time.Hour}
+	e.initialSince = time.Now().Add(-e.cfg.InitialBackfill)
+
+	var got time.Time
+	record := func(since time.Time) error { got = since; return nil }
+	fail := func(since time.Time) error { got = since; return errors.New("github is down") }
+	near := func(a, b time.Time) bool { return a.Sub(b).Abs() < time.Second }
+
+	// Never succeeded: resume from the first tick's look-back.
+	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+		t.Fatal(err)
+	}
+	if !near(got, e.initialSince) {
+		t.Errorf("first run since = %v, want the initial look-back %v", got, e.initialSince)
+	}
+
+	// Healthy: the usual window, nothing wider.
+	window := time.Now().Add(-e.cfg.Window())
+	if err := e.runFlow(key, window, record); err != nil {
+		t.Fatal(err)
+	}
+	if !near(got, window) {
+		t.Errorf("healthy run since = %v, want the window %v", got, window)
+	}
+
+	// Last success three hours ago: failed runs keep reaching back to it.
+	lastOK := time.Now().Add(-3 * time.Hour)
+	e.lastSynced[key] = lastOK
+	for range 2 {
+		if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), fail); err == nil {
+			t.Fatal("expected the failure to be returned")
+		}
+		if want := lastOK.Add(-e.cfg.PollInterval); !near(got, want) {
+			t.Errorf("failed run since = %v, want %v", got, want)
+		}
+	}
+	if !e.lastSynced[key].Equal(lastOK) {
+		t.Errorf("a failed run must not move the resume point")
+	}
+
+	// Older than InitialBackfill: capped, like a restart.
+	e.lastSynced[key] = time.Now().Add(-72 * time.Hour)
+	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Now().Add(-e.cfg.InitialBackfill); !near(got, want) {
+		t.Errorf("capped since = %v, want %v", got, want)
+	}
+	if time.Since(e.lastSynced[key]) > time.Second {
+		t.Errorf("a successful run must become the resume point")
 	}
 }
 
