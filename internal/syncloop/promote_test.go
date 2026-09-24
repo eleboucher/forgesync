@@ -26,12 +26,13 @@ type fakeFJClient struct {
 	openIssues      []*gitea.Issue
 	comments        []gitea.CreateIssueCommentOption
 	pushMirrorCalls int
+	searchErr       error
 }
 
 func (f *fakeFJClient) SetContext(context.Context) {}
 
 func (f *fakeFJClient) SearchRepos(gitea.SearchRepoOptions) ([]*gitea.Repository, *gitea.Response, error) {
-	return nil, nil, nil
+	return nil, nil, f.searchErr
 }
 
 func (f *fakeFJClient) ListPushMirrors(string, string, gitea.ListOptions) ([]*gitea.PushMirrorResponse, *gitea.Response, error) {

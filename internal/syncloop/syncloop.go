@@ -29,6 +29,7 @@ import (
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/githubapi"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/gitops"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/metrics"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/sink"
 	fjsink "git.erwanleboucher.dev/eleboucher/forgesync/internal/sink/forgejo"
 	ghsink "git.erwanleboucher.dev/eleboucher/forgesync/internal/sink/github"
@@ -168,7 +169,16 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) tick(parent context.Context, since time.Time) error {
+func (e *Engine) tick(parent context.Context, since time.Time) (err error) {
+	start := time.Now()
+	defer func() {
+		metrics.Ticks.WithLabelValues(metrics.Result(err)).Inc()
+		metrics.TickDuration.Observe(time.Since(start).Seconds())
+		if err == nil {
+			metrics.LastSuccess.SetToCurrentTime()
+		}
+	}()
+
 	// A whole-tick deadline is opt-in (FORGESYNC_TICK_TIMEOUT). It is a separate
 	// concern from Window() (the poll look-back); conflating them used to cancel
 	// large ticks at 2×pollInterval. Default 0 means: bound only by per-request
@@ -258,13 +268,13 @@ func (e *Engine) syncRepo(ctx context.Context, repo *gitea.Repository, since tim
 
 		mirror := host + "/" + target.Slug()
 		// Flow A: target → canonical
-		if err := e.runFlow(canonical.Slug()+"<-"+mirror, since, func(since time.Time) error {
+		if err := e.runFlow(flow{canonical.Slug(), mirror, directionInbound}, since, func(since time.Time) error {
 			return e.syncInbound(ctx, canonical, host, target, since)
 		}); err != nil {
 			e.log.Error("flow A failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
 		}
 		// Flow B: canonical → target
-		if err := e.runFlow(canonical.Slug()+"->"+mirror, since, func(since time.Time) error {
+		if err := e.runFlow(flow{canonical.Slug(), mirror, directionOutbound}, since, func(since time.Time) error {
 			return e.syncOutbound(ctx, canonical, host, target, since)
 		}); err != nil {
 			e.log.Error("flow B failed", "repo", repo.FullName, "remote", m.RemoteAddress, "err", err)
@@ -308,22 +318,42 @@ func (e *Engine) syncUpstreamPRs(ctx context.Context, canonical source.Repo, hos
 		return nil
 	}
 	src := e.upstream.UpstreamPullRequests(target.Owner)
-	return e.runFlow(canonical.Slug()+"<-"+upstream+"@"+target.Owner, since, func(since time.Time) error {
+	return e.runFlow(flow{canonical.Slug(), upstream + "@" + target.Owner, directionUpstream}, since, func(since time.Time) error {
 		return e.syncOneWay(ctx, src, parent, e.canonicalSink, canonical, since)
 	})
 }
 
+// flow identifies one sync direction between a canonical repo and a mirror,
+// for its resume point and its metrics.
+type flow struct {
+	repo      string // canonical owner/name
+	mirror    string // host/owner/name, plus @owner for the upstream flow
+	direction string // directionInbound, directionOutbound or directionUpstream
+}
+
+const (
+	directionInbound  = "inbound"  // Flow A: mirror → canonical
+	directionOutbound = "outbound" // Flow B: canonical → mirror
+	directionUpstream = "upstream" // the fork owner's PRs on the parent → canonical
+)
+
+func (f flow) key() string { return f.repo + "|" + f.direction + "|" + f.mirror }
+
 // runFlow runs one flow with its look-back widened by flowSince, and makes the
 // run the flow's new resume point only if it succeeded.
-func (e *Engine) runFlow(key string, since time.Time, run func(since time.Time) error) error {
+func (e *Engine) runFlow(f flow, since time.Time, run func(since time.Time) error) error {
 	start := time.Now()
-	if err := run(e.flowSince(key, since)); err != nil {
+	metrics.InitFlow(f.repo, f.mirror, f.direction)
+	err := run(e.flowSince(f.key(), since))
+	metrics.FlowRuns.WithLabelValues(f.repo, f.mirror, f.direction, metrics.Result(err)).Inc()
+	if err != nil {
 		return err
 	}
 	if e.lastSynced == nil {
 		e.lastSynced = map[string]time.Time{}
 	}
-	e.lastSynced[key] = start
+	e.lastSynced[f.key()] = start
+	metrics.FlowLastSuccess.WithLabelValues(f.repo, f.mirror, f.direction).Set(float64(start.Unix()))
 	return nil
 }
 
@@ -648,7 +678,9 @@ func (e *Engine) syncOneWay(ctx context.Context, src source.Provider, srcRepo so
 				Kind: kindComment,
 				ID:   c.ID,
 			}
-			if err := dst.UpsertComment(ctx, dstRepo, destNum, c, commentMarker); err != nil {
+			err := dst.UpsertComment(ctx, dstRepo, destNum, c, commentMarker)
+			metrics.Items.WithLabelValues(kindComment, src.Kind(), dst.Kind(), metrics.Result(err)).Inc()
+			if err != nil {
 				e.log.Error("upsert comment failed",
 					"dst_repo", dstRepo.Slug(), "dst_issue", destNum,
 					"src_comment", c.ID, "err", err)
@@ -697,6 +729,7 @@ func (e *Engine) routeIssue(ctx context.Context, src source.Provider, srcRepo so
 		ID:   iss.Number,
 	}
 	destNum, err := dst.UpsertIssue(ctx, dstRepo, iss, issueMarker)
+	metrics.Items.WithLabelValues(kindIssue, src.Kind(), dst.Kind(), metrics.Result(err)).Inc()
 	if err != nil {
 		e.log.Error("upsert issue failed",
 			"src_repo", srcRepo.Slug(), "src_num", iss.Number,

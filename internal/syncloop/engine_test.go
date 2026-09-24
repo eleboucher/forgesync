@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"code.gitea.io/sdk/gitea"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/config"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/marker"
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/metrics"
 	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
 
@@ -278,8 +280,66 @@ func TestSyncOneWay_ItemFailureFailsTheFlow(t *testing.T) {
 	}
 }
 
+func TestSyncOneWay_CountsItems(t *testing.T) {
+	src := &fakeSource{
+		kind: tForgejo, host: tFJHost,
+		issues: []source.Issue{
+			{Number: 1, Body: "ok", UpdatedAt: time.Now()},
+			{Number: 2, Body: "fails", UpdatedAt: time.Now()},
+		},
+		comments: map[int64][]source.Comment{
+			1: {{ID: 10, Body: "a reply", UpdatedAt: time.Now()}},
+		},
+	}
+	dst := &fakeSink{kind: tGithub, failIssue: 2}
+	count := func(kind, result string) float64 {
+		return testutil.ToFloat64(metrics.Items.WithLabelValues(kind, tForgejo, tGithub, result))
+	}
+	issuesOK, issuesErr, commentsOK := count(kindIssue, "ok"), count(kindIssue, "error"), count(kindComment, "ok")
+
+	_ = newEngine().syncOneWay(context.Background(), src, forkRepo(), dst, srcRepo(), time.Now())
+
+	if got := count(kindIssue, "ok") - issuesOK; got != 1 {
+		t.Errorf("issues ok = %v, want 1", got)
+	}
+	if got := count(kindIssue, "error") - issuesErr; got != 1 {
+		t.Errorf("issues error = %v, want 1", got)
+	}
+	if got := count(kindComment, "ok") - commentsOK; got != 1 {
+		t.Errorf("comments ok = %v, want 1", got)
+	}
+}
+
+func TestTick_RecordsResult(t *testing.T) {
+	e := newEngine()
+	e.cfg = &config.Config{}
+	fj := &fakeFJClient{}
+	e.fjClient = fj
+	ok, failed := testutil.ToFloat64(metrics.Ticks.WithLabelValues("ok")), testutil.ToFloat64(metrics.Ticks.WithLabelValues("error"))
+
+	if err := e.tick(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(metrics.LastSuccess); time.Since(time.Unix(int64(got), 0)) > 5*time.Second {
+		t.Errorf("last success = %v, want about now", got)
+	}
+	fj.searchErr = errors.New("forgejo is down")
+	if err := e.tick(context.Background(), time.Now()); err == nil {
+		t.Fatal("expected the search error")
+	}
+
+	if got := testutil.ToFloat64(metrics.Ticks.WithLabelValues("ok")) - ok; got != 1 {
+		t.Errorf("ok ticks = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.Ticks.WithLabelValues("error")) - failed; got != 1 {
+		t.Errorf("failed ticks = %v, want 1", got)
+	}
+}
+
 func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
-	const key = "me/src<-github.com/me/fork"
+	f := flow{repo: tOwner + "/" + tRepoSrc, mirror: "github.com/" + tOwner + "/" + tRepoFork, direction: directionInbound}
+	okBefore := testutil.ToFloat64(metrics.FlowRuns.WithLabelValues(f.repo, f.mirror, f.direction, "ok"))
+	errBefore := testutil.ToFloat64(metrics.FlowRuns.WithLabelValues(f.repo, f.mirror, f.direction, "error"))
 	e := newEngine()
 	e.cfg = &config.Config{PollInterval: 5 * time.Minute, InitialBackfill: 24 * time.Hour}
 	e.initialSince = time.Now().Add(-e.cfg.InitialBackfill)
@@ -290,7 +350,7 @@ func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
 	near := func(a, b time.Time) bool { return a.Sub(b).Abs() < time.Second }
 
 	// Never succeeded: resume from the first tick's look-back.
-	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+	if err := e.runFlow(f, time.Now().Add(-e.cfg.Window()), record); err != nil {
 		t.Fatal(err)
 	}
 	if !near(got, e.initialSince) {
@@ -299,7 +359,7 @@ func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
 
 	// Healthy: the usual window, nothing wider.
 	window := time.Now().Add(-e.cfg.Window())
-	if err := e.runFlow(key, window, record); err != nil {
+	if err := e.runFlow(f, window, record); err != nil {
 		t.Fatal(err)
 	}
 	if !near(got, window) {
@@ -308,29 +368,40 @@ func TestRunFlow_ResumesFromLastSuccess(t *testing.T) {
 
 	// Last success three hours ago: failed runs keep reaching back to it.
 	lastOK := time.Now().Add(-3 * time.Hour)
-	e.lastSynced[key] = lastOK
+	e.lastSynced[f.key()] = lastOK
 	for range 2 {
-		if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), fail); err == nil {
+		if err := e.runFlow(f, time.Now().Add(-e.cfg.Window()), fail); err == nil {
 			t.Fatal("expected the failure to be returned")
 		}
 		if want := lastOK.Add(-e.cfg.PollInterval); !near(got, want) {
 			t.Errorf("failed run since = %v, want %v", got, want)
 		}
 	}
-	if !e.lastSynced[key].Equal(lastOK) {
+	if !e.lastSynced[f.key()].Equal(lastOK) {
 		t.Errorf("a failed run must not move the resume point")
 	}
 
 	// Older than InitialBackfill: capped, like a restart.
-	e.lastSynced[key] = time.Now().Add(-72 * time.Hour)
-	if err := e.runFlow(key, time.Now().Add(-e.cfg.Window()), record); err != nil {
+	e.lastSynced[f.key()] = time.Now().Add(-72 * time.Hour)
+	if err := e.runFlow(f, time.Now().Add(-e.cfg.Window()), record); err != nil {
 		t.Fatal(err)
 	}
 	if want := time.Now().Add(-e.cfg.InitialBackfill); !near(got, want) {
 		t.Errorf("capped since = %v, want %v", got, want)
 	}
-	if time.Since(e.lastSynced[key]) > time.Second {
+	if time.Since(e.lastSynced[f.key()]) > time.Second {
 		t.Errorf("a successful run must become the resume point")
+	}
+
+	// 3 successful runs and 2 failed ones, each counted once.
+	if got := testutil.ToFloat64(metrics.FlowRuns.WithLabelValues(f.repo, f.mirror, f.direction, "ok")) - okBefore; got != 3 {
+		t.Errorf("ok runs counted = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(metrics.FlowRuns.WithLabelValues(f.repo, f.mirror, f.direction, "error")) - errBefore; got != 2 {
+		t.Errorf("failed runs counted = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(metrics.FlowLastSuccess.WithLabelValues(f.repo, f.mirror, f.direction)); int64(got) != e.lastSynced[f.key()].Unix() {
+		t.Errorf("last-success gauge = %v, want the resume point %d", got, e.lastSynced[f.key()].Unix())
 	}
 }
 
