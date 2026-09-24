@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/source"
 )
 
 const (
@@ -33,6 +35,15 @@ func TestShadowDrifted(t *testing.T) {
 				t.Errorf("got %v want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLabelColorFor(t *testing.T) {
+	if got := LabelColorFor(source.LabelChecksFailing); got != "cf222e" {
+		t.Errorf("status label color = %q, want its own", got)
+	}
+	if got := LabelColorFor(tBug); got != LabelColor {
+		t.Errorf("other label color = %q, want the default", got)
 	}
 }
 

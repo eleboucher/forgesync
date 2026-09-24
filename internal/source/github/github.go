@@ -26,12 +26,13 @@ func NewWithClient(c *gh.Client) *Provider {
 func (p *Provider) Kind() string { return "github" }
 func (p *Provider) Host() string { return "github.com" }
 
-// ListIssues returns both issues and PRs (PRs get a "[PR #N]" title prefix and
-// a link to the actual PR). Real PR sync — pushing branches and creating real
-// Forgejo PRs — is a separate path that lands with gitops support; this exposes
-// PR conversations as issues in the meantime.
+// ListIssues returns both issues and PRs (PRs get a "[PR #N]" title prefix, a
+// link to the actual PR and status labels). Real PR sync — pushing branches and
+// creating real Forgejo PRs — is a separate path that lands with gitops
+// support; this exposes PR conversations as issues in the meantime.
 func (p *Provider) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
 	out := []source.Issue{}
+	var prs []int64
 	listOpts := &gh.IssueListByRepoOptions{
 		State:       "all",
 		ListOptions: gh.ListOptions{PerPage: pageSize},
@@ -50,12 +51,15 @@ func (p *Provider) ListIssues(ctx context.Context, repo source.Repo, opts source
 		}
 		for _, i := range batch {
 			out = append(out, mapIssue(i))
+			if i.PullRequestLinks != nil {
+				prs = append(prs, int64(i.GetNumber()))
+			}
 		}
 		if len(batch) < pageSize {
 			break
 		}
 	}
-	return out, nil
+	return p.withPRStatus(ctx, repo, "", prTitle, out, prs, opts.Since)
 }
 
 func (p *Provider) ListPullRequests(_ context.Context, _ source.Repo, _ source.ListOpts) ([]source.PullRequest, error) {
@@ -91,6 +95,7 @@ type upstreamPRs struct {
 
 func (u *upstreamPRs) ListIssues(ctx context.Context, repo source.Repo, opts source.ListOpts) ([]source.Issue, error) {
 	out := []source.Issue{}
+	var prs []int64
 	listOpts := &gh.IssueListByRepoOptions{
 		State:       "all",
 		Creator:     u.author,
@@ -113,20 +118,29 @@ func (u *upstreamPRs) ListIssues(ctx context.Context, repo source.Repo, opts sou
 				continue
 			}
 			out = append(out, mapUpstreamPR(i))
+			prs = append(prs, int64(i.GetNumber()))
 		}
 		if len(batch) < pageSize {
 			break
 		}
 	}
-	return out, nil
+	return u.withPRStatus(ctx, repo, u.author, upstreamPRTitle, out, prs, opts.Since)
 }
 
 // mapUpstreamPR maps like mapIssue but with its own title prefix, so the
 // shadow is never mistaken for a "[PR #N]" shadow that /sync can promote.
 func mapUpstreamPR(i *gh.Issue) source.Issue {
 	iss := mapIssue(i)
-	iss.Title = fmt.Sprintf("[upstream PR #%d] %s", i.GetNumber(), i.GetTitle())
+	iss.Title = upstreamPRTitle(int64(i.GetNumber()), i.GetTitle())
 	return iss
+}
+
+func prTitle(number int64, title string) string {
+	return fmt.Sprintf("[PR #%d] %s", number, title)
+}
+
+func upstreamPRTitle(number int64, title string) string {
+	return fmt.Sprintf("[upstream PR #%d] %s", number, title)
 }
 
 // GetPullRequest fetches a single PR and maps it to source.PullRequest,
@@ -197,9 +211,12 @@ func mapIssue(i *gh.Issue) source.Issue {
 	title := i.GetTitle()
 	htmlURL := i.GetHTMLURL()
 	if i.PullRequestLinks != nil {
-		title = fmt.Sprintf("[PR #%d] %s", i.GetNumber(), title)
+		title = prTitle(int64(i.GetNumber()), title)
 		if u := i.PullRequestLinks.GetHTMLURL(); u != "" {
 			htmlURL = u
+		}
+		if i.PullRequestLinks.MergedAt != nil {
+			labels = append(labels, source.LabelMerged)
 		}
 	}
 	user := i.GetUser()

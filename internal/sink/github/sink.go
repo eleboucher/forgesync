@@ -224,7 +224,7 @@ func (s *Sink) ensureLabels(ctx context.Context, dest source.Repo, names []strin
 			out = append(out, existing)
 			continue
 		}
-		color := sink.LabelColor
+		color := sink.LabelColorFor(name)
 		if _, _, err := s.client.Issues.CreateLabel(ctx, dest.Owner, dest.Name, gh.CreateIssueLabelRequest{
 			Name:  name,
 			Color: &color,

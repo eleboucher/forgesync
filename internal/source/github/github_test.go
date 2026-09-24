@@ -39,11 +39,17 @@ func TestMapIssue_PRGetsTitlePrefixAndPRURL(t *testing.T) {
 
 func TestParentAndUpstreamPullRequests(t *testing.T) {
 	var creator string
+	fg := &fakeGraphQL{prs: map[int64]map[string]any{4: {
+		tNumber: 4, "title": "add postgres", tState: "OPEN",
+		"url": "https://github.com/up/proj/pull/4",
+	}}}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case tGraphQLPath:
+			fg.handle(w, r)
 		case "/repos/me/fork":
 			_ = json.NewEncoder(w).Encode(&gh.Repository{
-				Name:   gh.Ptr("fork"),
+				Name:   gh.Ptr(tForkName),
 				Parent: &gh.Repository{Name: gh.Ptr("proj"), Owner: &gh.User{Login: gh.Ptr("up")}},
 			})
 		case "/repos/me/solo":
@@ -72,7 +78,7 @@ func TestParentAndUpstreamPullRequests(t *testing.T) {
 	if _, ok, err := p.Parent(ctx, source.Repo{Owner: "me", Name: "solo"}); err != nil || ok {
 		t.Errorf("non-fork: ok=%v err=%v, want no parent", ok, err)
 	}
-	parent, ok, err := p.Parent(ctx, source.Repo{Owner: "me", Name: "fork"})
+	parent, ok, err := p.Parent(ctx, source.Repo{Owner: "me", Name: tForkName})
 	if err != nil || !ok || parent.Slug() != "up/proj" {
 		t.Fatalf("parent = %v ok=%v err=%v, want up/proj", parent, ok, err)
 	}
@@ -80,6 +86,12 @@ func TestParentAndUpstreamPullRequests(t *testing.T) {
 	prs, err := p.UpstreamPullRequests("me").ListIssues(ctx, parent, source.ListOpts{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if fg.search != "repo:up/proj is:pr is:open author:me" {
+		t.Errorf("open-PR search = %q, want the author's open PRs on the parent", fg.search)
+	}
+	if fg.detailsCalls != 1 {
+		t.Errorf("expected the PR to be fetched through GraphQL, got %d requests", fg.detailsCalls)
 	}
 	if creator != "me" {
 		t.Errorf("creator filter = %q, want me", creator)

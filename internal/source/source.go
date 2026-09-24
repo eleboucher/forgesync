@@ -56,6 +56,16 @@ type Comment struct {
 	UpdatedAt   time.Time
 }
 
+// Labels a source adds to a PR's shadow to show its status. Sinks give them
+// their own colors when creating them.
+const (
+	LabelMerged        = "merged"
+	LabelPromoted      = "promoted"
+	LabelChecksPassing = "checks: passing"
+	LabelChecksFailing = "checks: failing"
+	LabelChecksPending = "checks: pending"
+)
+
 type ListOpts struct {
 	Since time.Time
 }
