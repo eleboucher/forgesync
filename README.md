@@ -105,6 +105,18 @@ If a GitHub mirror target is itself a fork, forgesync also copies the pull reque
 
 These are read-only. Comments you add to them stay on Forgejo; reply on GitHub to reach the upstream maintainers. Line-level review comments are not copied, only the PR's conversation.
 
+## PR status labels
+
+Shadows of GitHub PRs (`[PR #N]` and `[upstream PR #N]`) get labels showing where the PR stands:
+
+| Label | Meaning |
+|---|---|
+| `merged` | the PR was merged on GitHub |
+| `promoted` | closed after `/sync` moved it into a canonical Forgejo |
+| `checks: passing` / `failing` / `pending` | the combined result of the PR's GitHub checks |
+
+`checks:` only reflects checks that run on GitHub. If a project's real CI runs elsewhere, it may only show a bot like a secret scanner. Each tick also checks open PRs that nothing else touched, so a check finishing still shows up (up to 100 open PRs per repo). forgesync swaps these labels itself and leaves your own labels alone. Reading PR status uses GitHub's GraphQL API with the same token.
+
 ## Keeping an issue on Forgejo
 
 Label an issue `local-only` (any case) in your canonical Forgejo and forgesync won't copy it, or its comments, to any mirror. Add the label before the next tick: an issue that has already been copied keeps its mirror copy, which simply stops receiving updates. Imported issues are unaffected, so replies to them still flow back to the mirror.

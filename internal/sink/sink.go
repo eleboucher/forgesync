@@ -64,6 +64,23 @@ func PropagateState(existingState, srcState string) *string {
 // destination, since the source only tells us the label's name.
 const LabelColor = "ededed"
 
+var statusLabelColors = map[string]string{
+	source.LabelMerged:        "6f42c1",
+	source.LabelPromoted:      "0969da",
+	source.LabelChecksPassing: "1a7f37",
+	source.LabelChecksFailing: "cf222e",
+	source.LabelChecksPending: "bf8700",
+}
+
+// LabelColorFor returns the color for a label a sink has to create: the PR
+// status labels get their own, everything else gets LabelColor.
+func LabelColorFor(name string) string {
+	if c, ok := statusLabelColors[name]; ok {
+		return c
+	}
+	return LabelColor
+}
+
 var syncedLabelsRe = regexp.MustCompile(`<!-- forgesync:labels=(\S*) -->`)
 
 // WithSyncedLabels appends a hidden note listing the labels forgesync set on a

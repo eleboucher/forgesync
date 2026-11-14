@@ -150,7 +150,7 @@ func (s *Sink) labelIDs(dest source.Repo, names []string, known []*gitea.Label) 
 		}
 		created, _, err := s.client.CreateLabel(dest.Owner, dest.Name, gitea.CreateLabelOption{
 			Name:  name,
-			Color: "#" + sink.LabelColor,
+			Color: "#" + sink.LabelColorFor(name),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create label %q: %w", name, err)
