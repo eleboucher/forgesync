@@ -47,7 +47,7 @@ cp configs/forgesync.example.yaml configs/forgesync.yaml
 | `FORGESYNC_POLL_INTERVAL`        | `5m`    | no                                           |
 | `FORGESYNC_INITIAL_BACKFILL`     | `1h`    | no (look-back on the first tick, and the furthest a failing flow catches up) |
 | `FORGESYNC_TICK_TIMEOUT`         | `0`     | no (`0` = no per-tick deadline)              |
-| `FORGESYNC_HEALTH_LISTEN`        | `:8080` | no                                           |
+| `FORGESYNC_HEALTH_LISTEN`        | `:8080` | no (serves `/healthz` and `/metrics`)    |
 | `FORGESYNC_LOG_FORMAT`           | `text`  | no (`text` or `json`)                        |
 | `FORGESYNC_LOG_LEVEL`            | `info`  | no                                           |
 
@@ -108,3 +108,34 @@ These are read-only. Comments you add to them stay on Forgejo; reply on GitHub t
 ## Keeping an issue on Forgejo
 
 Label an issue `local-only` (any case) in your canonical Forgejo and forgesync won't copy it, or its comments, to any mirror. Add the label before the next tick: an issue that has already been copied keeps its mirror copy, which simply stops receiving updates. Imported issues are unaffected, so replies to them still flow back to the mirror.
+
+## Metrics
+
+Prometheus metrics are served on `/metrics`, on the same listener as `/healthz`.
+
+| Metric | Use |
+|---|---|
+| `forgesync_last_success_timestamp_seconds` | when the last tick finished. A tick only fails if the canonical Forgejo can't be listed, so this says forgesync is running, not that every mirror syncs |
+| `forgesync_ticks_total{result}`, `forgesync_tick_duration_seconds` | how often ticks fail, and how long they take |
+| `forgesync_flow_runs_total{repo,mirror,direction,result}` | which repo, mirror or direction (`inbound`, `outbound`, `upstream`) is failing |
+| `forgesync_flow_last_success_timestamp_seconds{repo,mirror,direction}` | how far behind a failing flow is |
+| `forgesync_items_total{kind,from,to,result}` | issues and comments processed (written, or already up to date), and how many failed |
+| `forgesync_github_rate_limit_remaining{resource}` | how close you are to GitHub's rate limit |
+| `forgesync_build_info{version}` | the running version |
+
+Example alerts:
+
+```yaml
+# forgesync is down, or not being scraped.
+- alert: ForgesyncDown
+  expr: absent(forgesync_build_info)
+  for: 10m
+# forgesync runs, but ticks keep failing (the gauge is 0 until the first tick finishes).
+- alert: ForgesyncStale
+  expr: forgesync_last_success_timestamp_seconds > 0 and time() - forgesync_last_success_timestamp_seconds > 1800
+  for: 10m
+# One repo/mirror/direction keeps failing.
+- alert: ForgesyncFlowFailing
+  expr: increase(forgesync_flow_runs_total{result="error"}[30m]) > 0 and ignoring(result) increase(forgesync_flow_runs_total{result="ok"}[30m]) == 0
+  for: 15m
+```

@@ -1,4 +1,5 @@
-// Package health serves a tiny readiness/liveness HTTP endpoint.
+// Package health serves a tiny readiness/liveness HTTP endpoint, plus the
+// Prometheus metrics on /metrics.
 package health
 
 import (
@@ -7,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"git.erwanleboucher.dev/eleboucher/forgesync/internal/metrics"
 )
 
 type Server struct {
@@ -21,6 +24,7 @@ func New(addr string, logger *slog.Logger) *Server {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	mux.Handle("/metrics", metrics.Handler())
 	return &Server{
 		addr: addr,
 		srv: &http.Server{
